@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.media.projection.MediaProjectionManager
+import android.media.projection.MediaProjectionConfig
 import android.os.*
 import android.provider.Settings
 import android.view.View
@@ -33,13 +34,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var chart: MetricsChart
     private lateinit var progress: ProgressBar
     private val addresses = mutableListOf<String>()
-    private var startingPeer: String? = null
-    private var pendingSession: String? = null
+    private val captureConsent = CaptureConsentGate()
     private val accent = Color.rgb(41,212,181)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         settings = SettingsStore(this); Diagnostics.initialize(this)
         acceptComponentIntent(intent)
+        val savedSession = savedInstanceState?.getString(CAPTURE_SESSION)
+        val savedPeer = savedInstanceState?.getString(CAPTURE_PEER)
+        if (savedSession == Diagnostics.status.value.id && !savedPeer.isNullOrBlank() && Diagnostics.status.value.stage == Stage.IDLE) {
+            captureConsent.open(PendingCaptureStart(checkNotNull(savedSession),savedPeer))
+        }
         window.statusBarColor = Color.rgb(13,24,41); window.navigationBarColor = Color.rgb(13,24,41)
         val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(22),dp(18),dp(22),dp(24)); setBackgroundColor(Color.rgb(13,24,41)) }
         setContentView(ScrollView(this).apply { isFillViewport = true; addView(layout) })
@@ -53,9 +58,10 @@ class MainActivity : AppCompatActivity() {
         devices = Spinner(this).apply { setBackgroundColor(Color.rgb(232,239,248)); layout.addView(this) }
         button("刷新已配对车机") { permissions() }
         button("开始无线连接") { start() }
+        if (BuildConfig.IS_CARLIFE_COMPONENT) button("授权系统录屏后连接") { start(systemCapture = true) }
         button("停止连接") { startService(Intent(this,CarPlayTransmitterService::class.java).setAction(CarPlayTransmitterService.ACTION_STOP)) }
-        val audio = CheckBox(this).apply { text = if (BuildConfig.IS_CARLIFE_COMPONENT) "发送 vivo 宿主提供的媒体音频" else "发送允许捕获的媒体音频"; setTextColor(Color.WHITE); buttonTintList = checkTint(); isChecked = settings.audio; setOnCheckedChangeListener { _, checked -> settings.audio = checked }; layout.addView(this) }
-        text(if (BuildConfig.IS_CARLIFE_COMPONENT) "手机可主动发起蓝牙连接。投屏画面由 Jovi InCar 宿主提供，连接与首帧状态在此显示。" else "系统录屏路径支持 Android 10+。授权录屏后，由手机主动连接所选车机。",13f)
+        val audio = CheckBox(this).apply { text = if (BuildConfig.IS_CARLIFE_COMPONENT) "发送媒体音频（取决于所选投屏方式）" else "发送允许捕获的媒体音频"; setTextColor(Color.WHITE); buttonTintList = checkTint(); isChecked = settings.audio; setOnCheckedChangeListener { _, checked -> settings.audio = checked }; layout.addView(this) }
+        text(if (BuildConfig.IS_CARLIFE_COMPONENT) "默认由 Jovi InCar 宿主提供画面。若宿主拒绝组件，可点击“授权系统录屏后连接”，由手机主动连接车机并共享手机屏幕。音频与触控需要相应授权。" else "系统录屏路径支持 Android 10+。授权录屏后，由手机主动连接所选车机。",13f)
         counters = text("尚无发送数据")
         chart = MetricsChart(this).apply { layout.addView(this,LinearLayout.LayoutParams(-1,dp(170))) }
         text("连接阶段",18f); timeline = text("等待开始")
@@ -87,7 +93,7 @@ class MainActivity : AppCompatActivity() {
         CheckBox(this).apply { text = "使用根证书验证车机"; setTextColor(Color.WHITE); buttonTintList = checkTint(); isChecked = settings.requireRoot; setOnCheckedChangeListener { _,checked -> settings.requireRoot = checked }; layout.addView(this) }
         text("未启用根证书验证时，仅通过所选已配对车机的安全蓝牙连接绑定公钥，仍验证签名；公钥变化会停止连接。",13f)
         button("启用触控回传") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
-        if (BuildConfig.IS_CARLIFE_COMPONENT) text("组件包：${BuildConfig.APPLICATION_ID}\n宿主入口：com.vivo.car.CAR_SERVICE\n等待 Jovi InCar 启动组件后接收原生画面。",13f)
+        if (BuildConfig.IS_CARLIFE_COMPONENT) text("组件包：${BuildConfig.APPLICATION_ID}\n宿主入口：com.vivo.car.CAR_SERVICE\n原生投屏等待 Jovi InCar 启动组件；系统录屏每次连接都需重新授权。",13f)
         text("会话日志",18f); logs = text("暂无日志",12f).apply { setTextIsSelectable(true); typeface = Typeface.MONOSPACE }
         scope.launch { Diagnostics.status.collect { state ->
             status.text = state.stage.title
@@ -126,24 +132,35 @@ class MainActivity : AppCompatActivity() {
             override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
         }
     }
-    private fun start() = attempt {
+    private fun start(systemCapture: Boolean = false) = attempt {
+        check(captureConsent.pending == null) { "正在等待系统录屏授权，请先完成或取消" }
         check(Diagnostics.status.value.stage.step == 0) { "连接已在进行，请先停止" }
-        val id = Diagnostics.begin(); pendingSession = id
+        val id = Diagnostics.begin()
         try {
             Diagnostics.event("INFO","手机 ${Build.MANUFACTURER} ${Build.MODEL} / Android ${Build.VERSION.RELEASE}，应用 ${BuildConfig.VERSION_NAME}",id)
             check(!settings.requireRoot || settings.hasTrust()) { "请先导入车机认证根证书" }
-            if (settings.audio && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) { permissions(); return@attempt }
-            startingPeer = addresses.getOrNull(devices.selectedItemPosition) ?: error("请先选择已配对车机")
-            settings.peer = startingPeer
-            if (BuildConfig.IS_CARLIFE_COMPONENT) {
+            if (settings.audio && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                Diagnostics.stage(id,Stage.STOPPED,"请授权录音权限后重新开始连接")
+                permissions(); return@attempt
+            }
+            val peer = addresses.getOrNull(devices.selectedItemPosition) ?: error("请先选择已配对车机")
+            settings.peer = peer
+            if (BuildConfig.IS_CARLIFE_COMPONENT && !systemCapture) {
                 val request = NativeComponentState.request
                 Diagnostics.event("INFO",if (request == null) "蓝牙识别先行启动，原生画面入口等待 vivo 宿主调用" else "原生画面宿主入口已收到，启动无线握手",id)
-                startForegroundService(Intent(this,CarPlayTransmitterService::class.java).setAction(CarPlayTransmitterService.ACTION_START)
-                    .putExtra("peer",startingPeer).putExtra("sessionId",id).putExtra("nativeHost",request?.toIntent()))
+                dispatchConnection(id,Intent(this,CarPlayTransmitterService::class.java)
+                    .putExtra("peer",peer).putExtra("nativeHost",request?.toIntent()))
                 return@attempt
             }
-            startActivityForResult(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent(),CAPTURE)
+            captureConsent.open(PendingCaptureStart(id,peer))
+            Diagnostics.stage(id,Stage.IDLE,"等待系统录屏授权；本次由手机主动连接所选车机")
+            val projection = getSystemService(MediaProjectionManager::class.java)
+            val consent = if (BuildConfig.IS_CARLIFE_COMPONENT && Build.VERSION.SDK_INT >= 34)
+                projection.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+            else projection.createScreenCaptureIntent()
+            startActivityForResult(consent,CAPTURE)
         } catch (error: Exception) {
+            captureConsent.clear(id)
             Diagnostics.stage(id,Stage.FAILED,error.message ?: "启动检查失败")
             if (settings.autoUpload) DiagnosticUploader.enqueue(applicationContext,id)
             throw error
@@ -156,14 +173,12 @@ class MainActivity : AppCompatActivity() {
     @Deprecated("Uses the compatible system consent result contract")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode,resultCode,data)
+        if (requestCode == CAPTURE) { completeCapture(resultCode,data); return }
         if (resultCode != Activity.RESULT_OK || data == null) {
-            if (requestCode == CAPTURE) pendingSession?.let { Diagnostics.stage(it,Stage.STOPPED,"用户取消屏幕投射授权"); if (settings.autoUpload) DiagnosticUploader.enqueue(applicationContext,it) }
             return
         }
         attempt {
             when (requestCode) {
-                CAPTURE -> startForegroundService(Intent(this,CarPlayTransmitterService::class.java).setAction(CarPlayTransmitterService.ACTION_START)
-                    .putExtra("peer",startingPeer).putExtra("capture",data).putExtra("captureResult",resultCode).putExtra("sessionId",pendingSession))
                 TRUST -> data.data?.let { uri -> contentResolver.openInputStream(uri)?.use { input ->
                     val output = java.io.ByteArrayOutputStream(); val buffer = ByteArray(8192)
                     while (true) { val count = input.read(buffer); if (count < 0) break; check(output.size() + count <= 1_000_000) { "证书文件过大" }; output.write(buffer,0,count) }
@@ -172,6 +187,41 @@ class MainActivity : AppCompatActivity() {
                 EXPORT -> data.data?.let { uri -> contentResolver.openOutputStream(uri)?.use { output -> Diagnostics.export().inputStream().use { it.copyTo(output) } }; toast("日志已导出") }
             }
         }
+    }
+    private fun dispatchConnection(id: String, request: Intent) {
+        startForegroundService(request.setAction(CarPlayTransmitterService.ACTION_START).putExtra("sessionId",id))
+        Diagnostics.stage(id,Stage.BLUETOOTH,"正在启动无线连接")
+    }
+    private fun completeCapture(resultCode: Int, data: Intent?) {
+        val state = Diagnostics.status.value
+        val pending = captureConsent.consume(state.id,state.stage == Stage.IDLE)
+        if (pending == null) {
+            Diagnostics.event("WARN","已忽略过期或重复的录屏授权结果")
+            return
+        }
+        if (resultCode != Activity.RESULT_OK || data == null) {
+            Diagnostics.stage(pending.sessionId,Stage.STOPPED,"用户取消屏幕投射授权")
+            if (settings.autoUpload) DiagnosticUploader.enqueue(applicationContext,pending.sessionId)
+            return
+        }
+        attempt {
+            try {
+                Diagnostics.event("INFO","系统录屏授权已取得，本次使用系统画面来源",pending.sessionId)
+                dispatchConnection(pending.sessionId,Intent(this,CarPlayTransmitterService::class.java)
+                    .putExtra("peer",pending.peer).putExtra("capture",data).putExtra("captureResult",resultCode))
+            } catch (error: Exception) {
+                Diagnostics.stage(pending.sessionId,Stage.FAILED,error.message ?: "系统录屏连接启动失败")
+                if (settings.autoUpload) DiagnosticUploader.enqueue(applicationContext,pending.sessionId)
+                throw error
+            }
+        }
+    }
+    override fun onSaveInstanceState(outState: Bundle) {
+        captureConsent.pending?.let {
+            outState.putString(CAPTURE_SESSION,it.sessionId)
+            outState.putString(CAPTURE_PEER,it.peer)
+        }
+        super.onSaveInstanceState(outState)
     }
     private fun attempt(action: () -> Unit) { try { action() } catch (error: Exception) { toast(error.message ?: "操作失败") } }
     private fun selectConnectionDirection() {
@@ -217,7 +267,14 @@ class MainActivity : AppCompatActivity() {
         if (hasFocus) window.decorView.post { window.decorView.requestLayout(); window.decorView.invalidate() }
     }
     override fun onDestroy() { scope.cancel(); super.onDestroy() }
-    companion object { private const val PERMISSIONS = 1; private const val CAPTURE = 2; private const val TRUST = 3; private const val EXPORT = 4 }
+    companion object {
+        private const val PERMISSIONS = 1
+        private const val CAPTURE = 2
+        private const val TRUST = 3
+        private const val EXPORT = 4
+        private const val CAPTURE_SESSION = "pendingCaptureSession"
+        private const val CAPTURE_PEER = "pendingCapturePeer"
+    }
 }
 
 class MetricsChart(context: android.content.Context) : View(context) {

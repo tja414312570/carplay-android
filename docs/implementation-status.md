@@ -2,9 +2,11 @@
 
 ## 目标和构建产物
 
-目标是替换 vivo 使用的 CarLife 组件，发送无线 CarPlay。组件版包名为 `com.baidu.carlife.vivo`，版本代码 `100028`，版本名称 `8.8.4-carplay.0.18`。独立发送版保留在 `standalone` flavor。
+目标是替换 vivo 使用的 CarLife 组件，发送无线 CarPlay。组件版包名为 `com.baidu.carlife.vivo`，版本代码 `100033`，版本名称 `8.8.4-carplay.0.27`。独立发送版保留在 `standalone` flavor。
 
-构建：`./gradlew :app:assembleVivoComponentDebug`。组件 APK 位于 `app/build/outputs/apk/vivoComponent/debug/carplay-0.18.apk`。文件名模板为 `carplay-<版本号>.apk`，两个 flavor 的目录彼此独立。Android 原有签名、宿主权限和 UID 检查继续执行；宿主是否接纳组件需要真机验证。
+构建：`./gradlew :app:assembleVivoComponentDebug`。组件 APK 位于 `app/build/outputs/apk/vivoComponent/debug/carplay-0.27.apk`。文件名模板为 `carplay-<版本号>.apk`，两个 flavor 的目录彼此独立。Android 原有签名、宿主权限和 UID 检查继续执行；宿主是否接纳组件需要真机验证。
+
+0.27 最新交付：`artifacts/carplay-0.27.apk`，SHA-256 `78862dbfd068cd4ee023b0ab041095608a5ca2fb9a400f177735ebcf705447da`。组件身份和本机 debug 签名保持不变；新增“授权系统录屏后连接”，显式授权优先选择原有 MediaProjection 编码路径。默认原生路径保留，并在宿主 ComponentVerifier 拒绝时明确报错，停止无 interface token 的重试。此版本没有使宿主签名校验失效，也未证明实车首帧成功。详见 [修复映射与验证](vivo-host-capture-0.27.md)。
 
 2026-10-09 的旧交付副本保留在 `artifacts/carplay-vivo-carlife-8.8.4-debug.apk`，SHA-256 `327d88e779081eb90f6bb8fbc662994414f19498a3d4e2b4d357f60770dfbecd`。该副本使用与提供的 vivo v11 相同的本机 debug 签名；签名验证通过。
 
@@ -38,9 +40,9 @@
 
 0.17 历史副本：`artifacts/carplay-0.17.apk`，SHA-256 `af7d7320618613db3aca13b54c98dad28f467238dba89790733814b8a005cdec`。
 
-最新交付：`artifacts/carplay-0.18.apk`，SHA-256 `cc4629773f4e53f8fcba1488de10d2dd59375c50ca5de245ede15a372e4cb765`。AGP `androidComponents.onVariants` 从统一版本变量设置输出文件名，构建和 output-metadata.json 均使用 `carplay-0.18.apk`；包名、组件入口和签名证书保持不变，验签通过。
+0.18 历史交付：`artifacts/carplay-0.18.apk`，SHA-256 `cc4629773f4e53f8fcba1488de10d2dd59375c50ca5de245ede15a372e4cb765`。AGP `androidComponents.onVariants` 从统一版本变量设置输出文件名，构建和 output-metadata.json 均使用 `carplay-0.18.apk`；包名、组件入口和签名证书保持不变，验签通过。
 
-当前默认恢复手机主动连接，以及 0.12 的完整无线分组声明。0.16 首次升级会一次性修正 0.15 保存的连接方式/请求方案，保留地址、配对、认证密钥及其他设置；之后手动选择仍可生效。此版本纠正 0.13 起车机无界面反应的回退方向，不能当作已修好 0.12 的后续重新检测或完整投屏。
+当前默认手机主动连接与现代完整无线声明。0.16 曾恢复 0.12 的无线分组声明，0.19 再升级为现代完整声明；一次性偏好迁移保留地址、配对、认证密钥及其他设置，之后手动选择仍可生效。恢复车机界面反应不能当作完整投屏成功。
 
 0.17 在上述默认流程上记录真实车机版本，并对已观察的 GM A2LL / SA8155-1.0 / `aegean_orange_n-user 12 SQBP5-39 67 release-keys` 固件增加一次有界重新协商。仅在有效签名及现代完整声明后、尚无端点时处理边界检测包；保持同一安全 RFCOMM，关闭旧协议实例后重新同步、识别和验证新挑战，共用原 30 秒预算。未知固件、身份变化、普通 RESET、错误证明、重复恢复及停止/超时均不会继续。204 项 JVM 测试、两个 flavor 构建与 Lint、core-iap2 Lint 和验签通过。当前无 ADB 设备，实车效果尚未验证。
 

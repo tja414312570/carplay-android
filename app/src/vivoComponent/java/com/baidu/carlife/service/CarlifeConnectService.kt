@@ -34,7 +34,7 @@ class CarlifeConnectService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int { accept(intent); return START_NOT_STICKY }
     override fun onUnbind(intent: Intent?): Boolean { stopSelf(); return false }
     override fun onDestroy() {
-        if (NativeComponentState.clear(owned)) startService(Intent(this,CarPlayTransmitterService::class.java).setAction(CarPlayTransmitterService.ACTION_STOP))
+        if (NativeComponentState.clear(owned)) startService(Intent(this,CarPlayTransmitterService::class.java).setAction(CarPlayTransmitterService.ACTION_STOP_NATIVE_HOST))
         super.onDestroy()
     }
 }

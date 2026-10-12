@@ -3,6 +3,8 @@ package com.carplay.app
 import android.content.*
 import android.content.pm.PackageManager
 import android.os.IBinder
+import com.carplay.adapter.vivo.VivoHostBinder
+import com.carplay.adapter.vivo.VivoHostCallPolicy
 import com.carplay.app.diagnostics.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
@@ -21,7 +23,7 @@ object ComponentInterfaceCheck {
             val ready = CompletableFuture<String>()
             val connection = object : ServiceConnection {
                 override fun onServiceConnected(name: ComponentName, service: IBinder) {
-                    try { ready.complete(service.interfaceDescriptor) } catch (error: Exception) { ready.completeExceptionally(error) }
+                    try { ready.complete(VivoHostBinder.requireManagerDescriptor(service)) } catch (error: Exception) { ready.completeExceptionally(error) }
                 }
                 override fun onServiceDisconnected(name: ComponentName) { ready.completeExceptionally(IllegalStateException("宿主接口断开")) }
                 override fun onNullBinding(name: ComponentName) { ready.completeExceptionally(IllegalStateException("宿主接口为空")) }
@@ -41,11 +43,10 @@ object ComponentInterfaceCheck {
                 bound = app.bindService(Intent().setComponent(host),connection,Context.BIND_AUTO_CREATE)
                 check(bound) { "宿主拒绝接口绑定" }
                 val descriptor = ready.get(10,TimeUnit.SECONDS)
-                check(descriptor.isNullOrBlank() || descriptor == "com.baidu.carlife.mixing.aidl.ICarLifeCastManager") { "宿主接口类型不同：$descriptor" }
-                Diagnostics.event("INFO","已实际绑定 vivo 宿主 Binder：${descriptor ?: "默认(无描述符)"}",id)
-                Diagnostics.stage(id,Stage.STOPPED,"组件入口与宿主接口检查通过；未连接车机")
+                Diagnostics.event("INFO","宿主已允许当前组件读取投屏接口：$descriptor",id)
+                Diagnostics.stage(id,Stage.STOPPED,"组件入口存在，宿主接口可访问；尚未验证投屏或连接车机")
             } catch (error: Exception) {
-                Diagnostics.stage(id,Stage.FAILED,"组件接口检查失败：${error.message}")
+                Diagnostics.stage(id,Stage.FAILED,"组件接口检查失败：${VivoHostCallPolicy.failureMessage(error)}")
             } finally {
                 if (bound) runCatching { app.unbindService(connection) }
                 if (SettingsStore(app).autoUpload) runCatching { DiagnosticUploader.enqueue(app,id) }

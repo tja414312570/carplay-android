@@ -37,19 +37,14 @@ class VivoHostSurface(private val request: VivoHostRequest) : ProjectionSurfaceS
     private var downTime = 0L
     private val keyTimes = mutableMapOf<Int,Long>()
     private val death = IBinder.DeathRecipient { fail(IllegalStateException("vivo 宿主 Binder 已终止")) }
-    private var managerDescriptor = MANAGER
+    private var managerDescriptor = VivoHostBinder.MANAGER
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             try {
                 synchronized(lifecycleLock) {
                     check(!closing.get() && !closed.get())
-                    val desc = runCatching { binder.interfaceDescriptor }.getOrNull()
-                    diagnostic("vivo 宿主投屏服务已连接：${name.flattenToShortString()}，描述符=${desc ?: "无"}")
-                    if (!desc.isNullOrBlank()) {
-                        managerDescriptor = desc
-                    } else {
-                        diagnostic("vivo 宿主 Binder 描述符为空，保持默认描述符：$managerDescriptor")
-                    }
+                    managerDescriptor = VivoHostBinder.requireManagerDescriptor(binder)
+                    diagnostic("vivo 宿主投屏接口已确认：${name.flattenToShortString()}，描述符=$managerDescriptor")
                     binder.linkToDeath(death,0); manager.complete(binder)
                 }
                 diagnostic("vivo 原生 CarLife 投屏服务已绑定，等待实际显示回调")
@@ -125,11 +120,14 @@ class VivoHostSurface(private val request: VivoHostRequest) : ProjectionSurfaceS
         check(!closed.get()) { "宿主会话已关闭" }
         val data = Parcel.obtain(); val reply = Parcel.obtain()
         try {
-            if (descriptor.isNotBlank()) data.writeInterfaceToken(descriptor)
-            write(data)
-            check(remote.transact(code,data,reply,0)) { "宿主不支持事务 $code" }
-            reply.readException()
-            return read(reply)
+            return VivoHostCallPolicy.invoke("投屏事务 $code") {
+                require(descriptor.isNotBlank())
+                data.writeInterfaceToken(descriptor)
+                write(data)
+                check(remote.transact(code,data,reply,0)) { "宿主不支持事务 $code" }
+                reply.readException()
+                read(reply)
+            }
         }
         finally { data.recycle(); reply.recycle() }
     }
@@ -138,61 +136,27 @@ class VivoHostSurface(private val request: VivoHostRequest) : ProjectionSurfaceS
     override fun start(surface: Surface, width: Int, height: Int, fps: Int, pcm: (ByteArray,Int,Int,Int) -> Unit) {
         this.width = width; this.height = height; this.pcm = pcm
         val remote = manager.get(10,TimeUnit.SECONDS)
-        runCatching {
-            call(remote,managerDescriptor,4,{ it.writeStrongBinder(castCallback) },{})
-            diagnostic("已注册宿主投屏回调(code 4)")
-        }.onFailure { diagnostic("注册宿主投屏回调(code 4)失败或未实现: ${it.message}") }
-        runCatching {
+        call(remote,managerDescriptor,4,{ it.writeStrongBinder(castCallback) },{})
+        diagnostic("已注册宿主投屏回调(code 4)")
+        VivoHostCallPolicy.optional("注册宿主音频回调(code 3)", diagnostic) {
             call(remote,managerDescriptor,3,{ it.writeStrongBinder(audioCallback) },{})
             diagnostic("已注册宿主音频回调(code 3)")
-        }.onFailure { diagnostic("注册宿主音频回调(code 3)未实现或跳过: ${it.message}") }
+        }
         val params = JSONObject().put("width",width).put("height",height).put("real_width",width).put("real_height",height).put("default_width",width).put("default_height",height)
-        runCatching {
+        VivoHostCallPolicy.optional("通知 carlife_encode_format", diagnostic) {
             invoke(Intent("carlife_encode_format").putExtra("params",params.toString()))
             diagnostic("已发送 carlife_encode_format 通知")
-        }.onFailure { diagnostic("通知 carlife_encode_format 未实现或跳过: ${it.message}") }
-        runCatching {
+        }
+        VivoHostCallPolicy.optional("通知宿主连接状态", diagnostic) {
             invoke(Intent("carlife_other_notify_connect_status").putExtra("connect_status",true))
             connectedStatus = true
             diagnostic("已通知宿主连接状态 connected=true")
-        }.onFailure { diagnostic("通知连接状态未实现或跳过: ${it.message}") }
-        try {
-            call(remote,managerDescriptor,1,{
-                it.writeInt(1); it.writeInt(width); it.writeInt(height); it.writeInt(context.resources.displayMetrics.densityDpi); it.writeParcelable(surface,0)
-            },{})
-            prepared = true
-            diagnostic("宿主 prepareCast(code 1) 成功，等待实际显示回调")
-        } catch (e: Throwable) {
-            val isNotImplemented = e.message?.contains("Not yet implemented") == true
-            if (isNotImplemented && managerDescriptor.isNotEmpty()) {
-                diagnostic("prepareCast 带描述符未实现，尝试无描述符重试...")
-                runCatching {
-                    call(remote,"",1,{
-                        it.writeInt(1); it.writeInt(width); it.writeInt(height); it.writeInt(context.resources.displayMetrics.densityDpi); it.writeParcelable(surface,0)
-                    },{})
-                    prepared = true
-                    diagnostic("无描述符 prepareCast(code 1) 成功，等待实际显示回调")
-                }.onFailure {
-                    diagnostic("宿主 prepareCast(code 1) 最终失败: ${it.message}")
-                    throw it
-                }
-            } else if (isNotImplemented && managerDescriptor.isEmpty()) {
-                diagnostic("prepareCast 无描述符未实现，尝试标准描述符重试...")
-                runCatching {
-                    call(remote,MANAGER,1,{
-                        it.writeInt(1); it.writeInt(width); it.writeInt(height); it.writeInt(context.resources.displayMetrics.densityDpi); it.writeParcelable(surface,0)
-                    },{})
-                    prepared = true
-                    diagnostic("标准描述符 prepareCast(code 1) 成功，等待实际显示回调")
-                }.onFailure {
-                    diagnostic("宿主 prepareCast(code 1) 最终失败: ${it.message}")
-                    throw it
-                }
-            } else {
-                diagnostic("宿主 prepareCast(code 1) 失败: ${e.message}")
-                throw e
-            }
         }
+        call(remote,managerDescriptor,1,{
+            it.writeInt(1); it.writeInt(width); it.writeInt(height); it.writeInt(context.resources.displayMetrics.densityDpi); it.writeParcelable(surface,0)
+        },{})
+        prepared = true
+        diagnostic("宿主 prepareCast(code 1) 成功，等待实际显示回调")
         display.get(10,TimeUnit.SECONDS)
     }
     @Synchronized override fun touch(action: Int, x: Float, y: Float, pointer: Int): Boolean {
@@ -240,7 +204,6 @@ class VivoHostSurface(private val request: VivoHostRequest) : ProjectionSurfaceS
     }
     companion object {
         private const val PREFIX = "com.baidu.carlife.mixing.aidl."
-        private const val MANAGER = PREFIX+"ICarLifeCastManager"
         private const val CALLBACK = PREFIX+"ICarLifeCastCallback"
         private const val AUDIO = PREFIX+"ISystemAudioCallback"
     }

@@ -2,7 +2,7 @@ plugins {
     id("com.android.application")
 }
 
-val senderVersion = "0.26"
+val senderVersion = "0.27"
 
 android {
     namespace = "com.carplay.app"
@@ -12,7 +12,7 @@ android {
         applicationId = "com.carplay.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 26
+        versionCode = 27
         versionName = "$senderVersion.0"
     }
 
@@ -26,7 +26,7 @@ android {
         create("vivoComponent") {
             dimension = "distribution"
             applicationId = "com.baidu.carlife.vivo"
-            versionCode = 100032
+            versionCode = 100033
             versionName = "8.8.4-carplay.$senderVersion"
             buildConfigField("boolean", "IS_CARLIFE_COMPONENT", "true")
         }
