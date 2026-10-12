@@ -87,6 +87,7 @@ class CarPlayTransmitterService : Service() {
         val adapter = if (!BuildConfig.IS_CARLIFE_COMPONENT) ProjectionAdapterRegistry.getBestAdapter(this) else ProjectionCapture(route.label)
         if (adapter is ProjectionCapture) {
             adapter.captureAudio = settings.audio
+            adapter.inCarLauncher = settings.inCarLauncher
             when (route) {
                 ProjectionCaptureRoute.VIVO_HOST -> adapter.surfaceSource = VivoHostSurface(checkNotNull(native))
                 ProjectionCaptureRoute.WAIT_FOR_VIVO_HOST -> adapter.surfaceSource = DeferredVivoHostSurface { NativeComponentState.request }

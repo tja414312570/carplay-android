@@ -101,11 +101,21 @@ class MainActivity : AppCompatActivity() {
                 startActivity(launch)
             } }
             button("授予悬浮窗权限") { requestOverlayPermission() }
+            button("【悬浮窗】直接预览独立车载桌面") { startPreview() }
         }
         button("停止连接／验证") { stopProjection() }
         val audio = CheckBox(this).apply { text = if (BuildConfig.IS_CARLIFE_COMPONENT) "发送媒体音频（取决于所选投屏方式）" else "发送允许捕获的媒体音频"; setTextColor(Color.WHITE); buttonTintList = checkTint(); isChecked = settings.audio; setOnCheckedChangeListener { _, checked -> settings.audio = checked }; layout.addView(this) }
         carPlayControls += audio
-        carText(if (BuildConfig.IS_CARLIFE_COMPONENT) "默认由 Jovi InCar 宿主提供画面。若宿主拒绝组件，可点击“授权系统录屏后连接”，由手机主动连接车机并共享手机屏幕。音频与触控需要相应授权。" else "系统录屏路径支持 Android 10+。授权录屏后，由手机主动连接所选车机。",13f)
+        val launcherToggle = CheckBox(this).apply {
+            text = "独立车载桌面 (CarPlay 专属导航/音乐仪表卡片)"
+            setTextColor(Color.WHITE)
+            buttonTintList = checkTint()
+            isChecked = settings.inCarLauncher
+            setOnCheckedChangeListener { _, checked -> settings.inCarLauncher = checked }
+            layout.addView(this)
+        }
+        carPlayControls += launcherToggle
+        carText("【独立车载桌面】：开启后车机展示独立横屏车载仪表（导航/音乐/应用卡片），车机触控直接操作车载桌面，手机屏幕保持独立不被占用；关闭则为手机镜像。",13f)
         counters = text("尚无发送数据")
         chart = MetricsChart(this).apply { layout.addView(this,LinearLayout.LayoutParams(-1,dp(170))) }
         text("连接阶段",18f); timeline = text("等待开始")
@@ -360,7 +370,11 @@ class MainActivity : AppCompatActivity() {
         startActivityForResult(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,android.net.Uri.parse("package:$packageName")),OVERLAY)
     }
     private fun startPreview() = attempt {
-        check(BuildConfig.IS_CARLIFE_COMPONENT && settings.componentMode == ComponentMode.VERIFY_COMPONENT)
+        check(BuildConfig.IS_CARLIFE_COMPONENT)
+        if (settings.componentMode != ComponentMode.VERIFY_COMPONENT) {
+            settings.componentMode = ComponentMode.VERIFY_COMPONENT
+            updateModeControls()
+        }
         check(!ProjectionSessions.ownership.isBusy()) { "投屏或验证正在进行／清理，请先停止" }
         check(captureConsent.pending == null) { "正在等待系统录屏授权，请先完成或取消" }
         if (!Settings.canDrawOverlays(this)) { overlayPending = true; requestOverlayPermission(); return@attempt }

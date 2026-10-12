@@ -40,7 +40,9 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
     private val pendingKeyFrame = AtomicBoolean()
     @Volatile private var geometry: CaptureGeometry? = null
     var captureAudio = false
+    var inCarLauncher = true
     var surfaceSource: ProjectionSurfaceSource? = null
+    @Volatile private var carPresentation: CarLauncherPresentation? = null
     private data class NativePcm(val bytes: ByteArray, val sampleRate: Int)
     private val nativePcm = java.util.concurrent.ArrayBlockingQueue<NativePcm>(24)
     private var audioRate = 48000
@@ -112,9 +114,26 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
             }
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             val surface = encoder.createInputSurface(); inputSurface = surface; encoder.start()
-            if (pendingKeyFrame.getAndSet(false)) requestKeyFrame()
-            display = media?.createVirtualDisplay("CarPlay Sender", width, height, app.resources.displayMetrics.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, handler)
+            if (surfaceSource == null && inCarLauncher && media != null) {
+                display = media.createVirtualDisplay("CarPlay InCar Launcher", width, height,
+                    (app.resources.displayMetrics.densityDpi * 0.85f).toInt().coerceAtLeast(160),
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION, surface, null, handler)
+                Handler(Looper.getMainLooper()).post {
+                    display?.display?.let { secDisplay ->
+                        try {
+                            val presentation = CarLauncherPresentation(app, secDisplay)
+                            carPresentation = presentation
+                            presentation.show()
+                            observer?.diagnostic("已启动独立车载桌面 Presentation（${width}×${height}）")
+                        } catch (error: Exception) {
+                            observer?.diagnostic("车载 Presentation 启动异常：${error.message}")
+                        }
+                    }
+                }
+            } else {
+                display = media?.createVirtualDisplay("CarPlay Sender", width, height, app.resources.displayMetrics.densityDpi,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, handler)
+            }
             surfaceSource?.let { source ->
                 if (captureAudio) startNativeAudio()
                 source.start(surface,width,height,fps) { pcm,rate,channels,encoding ->
@@ -228,6 +247,11 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
     }
     override fun onTouchEvent(action: Int, x: Float, y: Float, pointerId: Int) {
         surfaceSource?.let { check(it.touch(action,x,y,pointerId)) { "宿主触控回调未接受操作" }; return }
+        val presentation = carPresentation
+        if (presentation != null && presentation.isShowing) {
+            presentation.dispatchTouch(action, x, y, pointerId)
+            return
+        }
         val point = checkNotNull(geometry) { "捕获画面尺寸尚未就绪" }.point(x,y) ?: return
         check(ProjectionInput.touch?.invoke(action, point.first, point.second, pointerId) == true) { "触控未执行：请启用无障碍输入服务" }
     }
@@ -243,6 +267,10 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
     override suspend fun stopProjection() { release() }
     private fun release() {
         if (!stopped.compareAndSet(false, true)) { runCatching { surfaceSource?.close() }; return }
+        carPresentation?.let { p ->
+            Handler(Looper.getMainLooper()).post { runCatching { p.dismiss() } }
+            carPresentation = null
+        }
         runCatching { surfaceSource?.close() }; nativePcm.clear()
         runCatching { audio?.stop() }; audioThread?.let { if (it != Thread.currentThread()) it.join(1000) }
         runCatching { audio?.release() }; audio = null

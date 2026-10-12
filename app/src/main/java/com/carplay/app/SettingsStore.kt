@@ -43,6 +43,9 @@ class SettingsStore(private val context: Context) {
     var audio: Boolean
         get() = prefs.getBoolean("audio", false)
         set(value) { prefs.edit().putBoolean("audio", value).apply() }
+    var inCarLauncher: Boolean
+        get() = prefs.getBoolean("inCarLauncher", true)
+        set(value) { prefs.edit().putBoolean("inCarLauncher", value).apply() }
     var autoUpload: Boolean
         get() = prefs.getBoolean("autoUpload", true)
         set(value) { prefs.edit().putBoolean("autoUpload", value).apply() }

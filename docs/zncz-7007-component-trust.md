@@ -77,3 +77,9 @@ Until that contract is available, the existing system-consent capture path can e
 The newest 40 uploaded ZIPs were checked for component-verification mode and the known host rejection. The newest matching verification session remains `d2ecfe40-193a-4167-aec3-50f9842bddbe`, uploaded at 12:34:57: `VERIFY_COMPONENT`, `FAILED`, 205 ms elapsed, zero displayed frames, rejection during descriptor query. More recent uploads through 13:14:24 lack the verification-mode field and do not establish a new native-capture result.
 
 The retained main/system logcat tail did not contain matching signature-rejection records during this read-only check. Absence from that bounded buffer is not evidence of acceptance; no fresh native capture attempt was triggered in this follow-up.
+
+## Carbit-specific follow-up
+
+The [Carbit investigation](carbit-channel-investigation.md) identifies the original signed `assets/carman_692.apk` bundled with this exact host and its separate SDK-based native capture/audio flow. Its startup path differs from CarLifeMixingService. The signature permission on the component's own service protects the **incoming host caller**; it must not be used alone to infer a required vivo signing identity for that component.
+
+Deeper code and DEX analysis now establishes the missing Carbit signing gate: `CarConnection.L` delegates to `DisplayConnectionSelector`; its parent `AbsConnectionSelector.d` reads the current package's registered sign and invokes `ComponentVerifier.j`. With the built-in nonempty Carbit sign, a different installed certificate fails. Only the successful callback schedules the normal binding task. The SDK callback Stub's lack of a repeated CarLife-style verifier does not remove this earlier authorization step. No self-signed replacement was installed or exercised, and no native trust success is claimed.

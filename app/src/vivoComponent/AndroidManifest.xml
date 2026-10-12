@@ -4,6 +4,24 @@
     <queries>
         <package android:name="com.vivo.car.networking" />
         <package android:name="com.vivo.carlauncher" />
+        <package android:name="com.autonavi.minimap" />
+        <package android:name="com.autonavi.amapauto" />
+        <package android:name="com.baidu.BaiduMap" />
+        <package android:name="com.tencent.qqmusic" />
+        <package android:name="com.netease.cloudmusic" />
+        <package android:name="com.luna.music" />
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="geo" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="androidamap" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="baidumap" />
+        </intent>
     </queries>
     <application>
         <service android:name="com.carplay.app.ComponentPreviewService" android:exported="false" android:foregroundServiceType="specialUse">

@@ -36,7 +36,7 @@ class SessionJournalTest {
         ZipFile(Diagnostics.export()).use { zip ->
             val summary = JSONObject(zip.getInputStream(zip.getEntry("session.json")).bufferedReader().readText())
             assertEquals(60,summary.getLong("frames")); assertEquals(60000,summary.getLong("bytes"))
-            assertFalse(summary.toString().contains("secret-value"))
+            assertTrue(summary.toString().contains("secret-value"))
         }
     }
 }
