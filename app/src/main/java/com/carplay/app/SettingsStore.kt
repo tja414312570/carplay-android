@@ -37,6 +37,9 @@ class SettingsStore(private val context: Context) {
     var peer: String?
         get() = prefs.getString("peer", null)
         set(value) { prefs.edit().putString("peer", value).apply() }
+    var componentMode: ComponentMode
+        get() = ComponentMode.restore(prefs.getString("componentMode", null), BuildConfig.IS_CARLIFE_COMPONENT)
+        set(value) { check(BuildConfig.IS_CARLIFE_COMPONENT); prefs.edit().putString("componentMode", value.name).apply() }
     var audio: Boolean
         get() = prefs.getBoolean("audio", false)
         set(value) { prefs.edit().putBoolean("audio", value).apply() }

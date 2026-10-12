@@ -23,6 +23,7 @@ class CarPlayTransmitterService : Service() {
     @Volatile private var connection: WirelessConnection? = null
     @Volatile private var sessionId: String? = null
     @Volatile private var captureRoute: ProjectionCaptureRoute? = null
+    private var ownedLease: ProjectionSessionOwnership.Lease? = null
     override fun onCreate() { super.onCreate(); Diagnostics.initialize(this) }
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -33,6 +34,10 @@ class CarPlayTransmitterService : Service() {
             return START_NOT_STICKY
         }
         if (intent?.action != ACTION_START) return START_NOT_STICKY
+        if (BuildConfig.IS_CARLIFE_COMPONENT && SettingsStore(this).componentMode != ComponentMode.CARPLAY) {
+            Diagnostics.event("WARN","当前为组件验证模式，已忽略无线 CarPlay 启动请求")
+            stop(); stopSelf(startId); return START_NOT_STICKY
+        }
         if (connection != null) {
             intent.getStringExtra("sessionId")?.takeIf { it != sessionId && it == Diagnostics.status.value.id }?.let {
                 Diagnostics.stage(it,Stage.FAILED,"上一连接仍在清理，请稍后重新连接并授权")
@@ -40,6 +45,11 @@ class CarPlayTransmitterService : Service() {
             }
             return START_NOT_STICKY
         }
+        if (ProjectionSessions.ownership.isBusy()) {
+            Diagnostics.event("WARN","上一投屏仍在清理，请稍后重新开始")
+            stopSelf(startId); return START_NOT_STICKY
+        }
+        val lease = ProjectionSessions.ownership.claim(ComponentMode.CARPLAY); ownedLease = lease
         val data = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra("capture",Intent::class.java) else {
             @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>("capture")
         }
@@ -58,6 +68,7 @@ class CarPlayTransmitterService : Service() {
                 intent.getIntExtra("captureResult",Activity.RESULT_CANCELED),hostIntent != null)
             native = if (route == ProjectionCaptureRoute.VIVO_HOST) VivoHostRequest.from(checkNotNull(hostIntent)) else null
         } catch (error: Exception) {
+            ProjectionSessions.ownership.release(lease); ownedLease = null
             Diagnostics.stage(id,Stage.FAILED,error.message ?: "投屏来源无效")
             if (SettingsStore(this).autoUpload) runCatching { DiagnosticUploader.enqueue(applicationContext,id) }
             stopSelf(startId)
@@ -93,12 +104,13 @@ class CarPlayTransmitterService : Service() {
             try { current.run() } catch (error: Exception) {
                 if (connection === current) Diagnostics.stage(id,Stage.FAILED,VivoHostCallPolicy.failureMessage(error))
             } finally {
-                current.close()
+                ProjectionSessions.ownership.finish(lease) { current.close() }
                 // onStartCommand and onDestroy run on the main thread. Finalize there so
                 // old completion cannot remove a new session's notification or source.
                 main.post {
                     if (connection === current) {
                         connection = null; captureRoute = null
+                        if (ownedLease === lease) ownedLease = null
                         if (Diagnostics.status.value.stage != Stage.FAILED) Diagnostics.stage(id,Stage.STOPPED,"连接已结束")
                         if (settings.autoUpload) cleanup.execute { runCatching { DiagnosticUploader.enqueue(applicationContext,id) } }
                         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(startId)
@@ -110,11 +122,12 @@ class CarPlayTransmitterService : Service() {
     }
     private fun stop() {
         val old = connection; connection = null; captureRoute = null
-        if (old == null) { stopForeground(STOP_FOREGROUND_REMOVE); return }
+        val lease = ownedLease; ownedLease = null
+        if (old == null) { lease?.let(ProjectionSessions.ownership::release); stopForeground(STOP_FOREGROUND_REMOVE); return }
         val oldId = sessionId
         sessionId?.let { Diagnostics.stage(it,Stage.STOPPED,"用户停止连接") }
         cleanup.execute {
-            old?.close()
+            if (lease == null) old.close() else ProjectionSessions.ownership.finish(lease) { old.close() }
             if (SettingsStore(applicationContext).autoUpload && oldId != null) runCatching { DiagnosticUploader.enqueue(applicationContext,oldId) }
         }
         stopForeground(STOP_FOREGROUND_REMOVE)

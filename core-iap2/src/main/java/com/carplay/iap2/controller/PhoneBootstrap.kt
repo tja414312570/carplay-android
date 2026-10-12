@@ -218,7 +218,7 @@ class PhoneBootstrap(
         if (profile != PhoneBootstrapProfile.GENERIC) {
             if (publishReferenceReadiness || acceptsNotification(0x4e0d)) send(Iap2Messages.buildRaw(0x4e0d) { u8(0, 1) })
             if (supportsStart) {
-                if (profile == PhoneBootstrapProfile.MODERN_WIRELESS && versionInfo == PhoneBluetoothRecovery.OBSERVED_FIRMWARE) {
+                if (profile == PhoneBootstrapProfile.MODERN_WIRELESS && PhoneBluetoothRecovery.isObservedFirmware(versionInfo)) {
                     diagnostic("GM 完整无线声明：0x4300 同时包含 group(0) 有线传输标识与 group(1) 蓝牙传输标识，满足车机 IAPAuthenticator 属性 1/2 门控")
                 }
                 if (profile == PhoneBootstrapProfile.VIVO_WIRELESS_MINIMAL) {

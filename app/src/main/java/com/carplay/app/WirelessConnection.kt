@@ -269,7 +269,7 @@ class WirelessConnection(private val context: Context, private val id: String, p
             val status = session.handshakeStatus()
             Diagnostics.event("WARN","控制阶段超时：已完成写入=${status.sentBytes}字节，已接收=${status.receivedBytes}字节，控制会话=${status.controlSessionId}；身份=${bootstrap.status().identified}，签名验证=${bootstrap.status().authenticated}",id)
             val detail = bootstrap.status().timeoutDetail()
-            if (bootstrap.status().authenticated && bootstrap.accessoryVersionInfo() == PhoneBluetoothRecovery.OBSERVED_FIRMWARE) {
+            if (bootstrap.status().authenticated && PhoneBluetoothRecovery.isObservedFirmware(bootstrap.accessoryVersionInfo())) {
                 "$detail；若为首次连接请在车机屏幕确认无线 CarPlay 弹窗或点击车机投屏图标触发第二阶段会话"
             } else detail
         }
@@ -364,9 +364,17 @@ class WirelessConnection(private val context: Context, private val id: String, p
             override fun dropped(count: Long) { repeat(count.toInt()) { Diagnostics.video(id,0,true) } }
             override fun audioSent() { Diagnostics.audio(id) }
             override fun audioFormat(format: SenderAudioFormat) { adapter.configureAudio(format.sampleRate,format.channels) }
-            override fun bluetoothControlAvailable(): Boolean = !closed.get() && !bluetoothRetired.get() &&
-                !session.isClosed && bootstrap.status().authenticated && bootstrap.status().endpointReceived &&
-                bootstrap.accessoryIdentityFingerprint() == verifiedBluetoothIdentity
+            override fun bluetoothControlAvailable(): Boolean {
+                val notClosed = !closed.get()
+                val notRetired = !bluetoothRetired.get()
+                val notSessionClosed = !session.isClosed
+                val authenticated = bootstrap.status().authenticated
+                val endpointReceived = bootstrap.status().endpointReceived
+                val identityMatch = java.security.MessageDigest.isEqual(bootstrap.accessoryIdentityFingerprint(), verifiedBluetoothIdentity)
+                val available = notClosed && notRetired && notSessionClosed && authenticated && endpointReceived && identityMatch
+                Diagnostics.event("INFO", "蓝牙控制通道检查: available=$available (notClosed=$notClosed, notRetired=$notRetired, notSessionClosed=$notSessionClosed, authenticated=$authenticated, endpointReceived=$endpointReceived, identityMatch=$identityMatch)", id)
+                return available
+            }
             override fun iapControl(stream: BlockingDuplexByteStream): CompletableFuture<Unit> {
                 val completion = CompletableFuture<Unit>()
                 own(AutoCloseable { completion.cancel(true) })
@@ -680,10 +688,10 @@ class WirelessConnection(private val context: Context, private val id: String, p
             }))
         try {
             bonjour.start()
-        } catch (failure: java.io.IOException) {
+        } catch (failure: Exception) {
             bonjour.close()
             if (direct.isEmpty() || config.port == null) throw failure
-            Diagnostics.event("WARN","手机 Bonjour 发布失败：${failure.javaClass.simpleName}；使用已认证 iAP2 端点直连",id)
+            Diagnostics.event("WARN","手机 Bonjour 启动异常：${failure.message ?: failure.javaClass.simpleName}；使用已认证 iAP2 端点直连",id)
         }
         val invitation = Thread({
             try {

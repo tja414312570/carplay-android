@@ -50,6 +50,14 @@
             android:enabled="true"
             android:exported="false" />
 
+        <receiver
+            android:name=".P2pDirectTestReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.carplay.app.TEST_P2P" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

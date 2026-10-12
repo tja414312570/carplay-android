@@ -80,14 +80,15 @@ internal class VehicleBonjour(
             check(!closed.get())
             if (Build.VERSION.SDK_INT >= 33) {
                 val info = NsdServiceInfo().apply {
-                    serviceName = "CarPlay Android"; serviceType = "_carplay-ctrl._tcp"; setPort(port); setNetwork(network)
+                    serviceName = "CarPlay Android"; serviceType = "_carplay-ctrl._tcp"
+                    setPort(this@VehicleBonjour.port); setNetwork(this@VehicleBonjour.network)
                     setAttribute("id",transport); setAttribute("srcvers","320.17")
                 }
                 registered = true
                 manager.registerService(info,NsdManager.PROTOCOL_DNS_SD,registration)
                 discovering = true
                 manager.discoverServices("_airplay._tcp",NsdManager.PROTOCOL_DNS_SD,network,executor,discovery)
-                diagnostic("Bonjour 发布与发现限定车机 Wi-Fi：network=${network.networkHandle}")
+                diagnostic("Bonjour 发布与发现限定车机 Wi-Fi：network=${network.networkHandle}，port=$port")
             } else {
                 val dns = JmDNS.create(local,"CarPlay Android"); legacy = dns
                 dns.registerService(ServiceInfo.create("_carplay-ctrl._tcp.local.","CarPlay Android",port,0,0,mapOf("id" to transport,"srcvers" to "320.17")))
@@ -106,13 +107,15 @@ internal class VehicleBonjour(
     }
     private fun releaseRegistration() {
         if (registered) {
-            runCatching { manager.unregisterService(registration) }.onSuccess { registered = false }
+            registered = false
+            runCatching { manager.unregisterService(registration) }
                 .onFailure { diagnostic("Bonjour 撤销请求失败：${it.javaClass.simpleName}") }
         }
     }
     private fun releaseDiscovery() {
         if (discovering) {
-            runCatching { manager.stopServiceDiscovery(discovery) }.onSuccess { discovering = false }
+            discovering = false
+            runCatching { manager.stopServiceDiscovery(discovery) }
                 .onFailure { diagnostic("Bonjour 停止请求失败：${it.javaClass.simpleName}") }
         }
     }

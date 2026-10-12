@@ -2,7 +2,7 @@ plugins {
     id("com.android.application")
 }
 
-val senderVersion = "0.28"
+val senderVersion = "0.31"
 
 android {
     namespace = "com.carplay.app"
@@ -12,7 +12,7 @@ android {
         applicationId = "com.carplay.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 28
+        versionCode = 31
         versionName = "$senderVersion.0"
     }
 
@@ -26,7 +26,7 @@ android {
         create("vivoComponent") {
             dimension = "distribution"
             applicationId = "com.baidu.carlife.vivo"
-            versionCode = 100034
+            versionCode = 100036
             versionName = "8.8.4-carplay.$senderVersion"
             buildConfigField("boolean", "IS_CARLIFE_COMPONENT", "true")
         }
@@ -51,6 +51,26 @@ androidComponents {
             output.outputFileName.set("carplay-$senderVersion.apk")
         }
     }
+}
+
+val copyApkToArtifacts = tasks.register("copyApkToArtifacts") {
+    val artifactsDir = rootProject.layout.projectDirectory.dir("artifacts")
+    val apkFile = layout.buildDirectory.file("outputs/apk/vivoComponent/debug/carplay-$senderVersion.apk")
+    inputs.file(apkFile)
+    outputs.file(artifactsDir.file("carplay-$senderVersion.apk"))
+    doLast {
+        val src = apkFile.get().asFile
+        if (src.exists()) {
+            val targetDir = artifactsDir.asFile
+            if (!targetDir.exists()) targetDir.mkdirs()
+            src.copyTo(File(targetDir, src.name), overwrite = true)
+            logger.lifecycle("Copied ${src.name} to ${targetDir.absolutePath}")
+        }
+    }
+}
+
+tasks.matching { it.name == "assembleVivoComponentDebug" }.configureEach {
+    finalizedBy(copyApkToArtifacts)
 }
 
 dependencies {

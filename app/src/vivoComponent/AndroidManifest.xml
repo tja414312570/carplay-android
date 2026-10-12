@@ -1,9 +1,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <queries>
         <package android:name="com.vivo.car.networking" />
         <package android:name="com.vivo.carlauncher" />
     </queries>
     <application>
+        <service android:name="com.carplay.app.ComponentPreviewService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User initiated local preview of Jovi authorized CarLife component output for offline diagnostics" />
+        </service>
         <activity-alias android:name="com.baidu.carlife.CarlifeActivity" android:targetActivity="com.carplay.app.MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="com.baidu.carlife.Action.CarlifePlatform" />
