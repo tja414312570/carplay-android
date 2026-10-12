@@ -10,6 +10,7 @@ import android.os.*
 import com.carplay.adapter.*
 import com.carplay.sender.VideoPackets
 import com.carplay.sender.CaptureGeometry
+import com.carplay.media.Pcm16Resampler
 import java.util.concurrent.atomic.AtomicBoolean
 
 object ProjectionInput {
@@ -40,7 +41,15 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
     @Volatile private var geometry: CaptureGeometry? = null
     var captureAudio = false
     var surfaceSource: ProjectionSurfaceSource? = null
-    private val nativePcm = java.util.concurrent.ArrayBlockingQueue<ByteArray>(24)
+    private data class NativePcm(val bytes: ByteArray, val sampleRate: Int)
+    private val nativePcm = java.util.concurrent.ArrayBlockingQueue<NativePcm>(24)
+    private var audioRate = 48000
+    override fun configureAudio(sampleRate: Int, channels: Int) {
+        check(stopped.get()) { "捕获已启动，不能修改音频格式" }
+        require(sampleRate in listOf(44100,48000) && channels == 2)
+        audioRate = sampleRate
+        observer?.diagnostic("音频捕获将使用实际协商格式：$sampleRate Hz / $channels 声道")
+    }
 
     override fun setObserver(observer: ProjectionObserver) { this.observer = observer }
     override fun setGrant(grant: ProjectionGrant) { check(projection == null); this.grant = grant; consumed = false }
@@ -99,6 +108,7 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, (width.toLong() * height * fps / 8).coerceIn(1_000_000, 20_000_000).toInt())
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps); setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                if (Build.VERSION.SDK_INT >= 29) setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER,fps.toFloat())
             }
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             val surface = encoder.createInputSurface(); inputSurface = surface; encoder.start()
@@ -109,9 +119,9 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
                 if (captureAudio) startNativeAudio()
                 source.start(surface,width,height,fps) { pcm,rate,channels,encoding ->
                     if (captureAudio && !stopped.get()) {
-                        if (rate != 48000 || channels != 2 || encoding != AudioFormat.ENCODING_PCM_16BIT || pcm.size % 4 != 0) {
+                        if (rate !in listOf(44100,48000) || channels != 2 || encoding != AudioFormat.ENCODING_PCM_16BIT || pcm.size % 4 != 0) {
                             observer?.failed(IllegalArgumentException("宿主 PCM 格式不匹配：$rate Hz / $channels 声道 / $encoding"))
-                        } else if (!nativePcm.offer(pcm.copyOf())) observer?.diagnostic("宿主音频接收队列满，已记录丢包")
+                        } else if (!nativePcm.offer(NativePcm(pcm.copyOf(),rate))) observer?.diagnostic("宿主音频接收队列满，已记录丢包")
                     }
                 }
             }
@@ -124,7 +134,7 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
 
     private fun startNativeAudio() {
         val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC); audioCodec = encoder
-        encoder.configure(MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC,48000,2).apply {
+        encoder.configure(MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC,audioRate,2).apply {
             setInteger(MediaFormat.KEY_AAC_PROFILE,MediaCodecInfo.CodecProfileLevel.AACObjectLC)
             setInteger(MediaFormat.KEY_BIT_RATE,128000); setInteger(MediaFormat.KEY_MAX_INPUT_SIZE,262144)
         },null,null,MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -132,6 +142,7 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
         audioThread = Thread({
             try {
                 var samples = 0L; val info = MediaCodec.BufferInfo()
+                var sourceRate: Int? = null; var resampler: Pcm16Resampler? = null
                 fun drain() {
                     var index = encoder.dequeueOutputBuffer(info,0)
                     while (index >= 0) {
@@ -143,8 +154,14 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
                     }
                 }
                 while (!stopped.get()) {
-                    val bytes = nativePcm.poll(100,java.util.concurrent.TimeUnit.MILLISECONDS)
-                    if (bytes != null) {
+                    val packet = nativePcm.poll(100,java.util.concurrent.TimeUnit.MILLISECONDS)
+                    if (packet != null) {
+                        if (sourceRate == null) {
+                            sourceRate = packet.sampleRate; resampler = Pcm16Resampler(packet.sampleRate,audioRate)
+                            observer?.diagnostic("宿主真实 PCM ${packet.sampleRate} Hz → 协商输出 $audioRate Hz / 2 声道")
+                        }
+                        check(sourceRate == packet.sampleRate) { "宿主 PCM 采样率在会话中发生变化" }
+                        val bytes = checkNotNull(resampler).convert(packet.bytes)
                         var offset = 0
                         while (offset < bytes.size && !stopped.get()) {
                             val index = encoder.dequeueInputBuffer(10000)
@@ -152,7 +169,7 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
                             val input = checkNotNull(encoder.getInputBuffer(index)).apply { clear() }
                             val count = minOf(input.remaining(),bytes.size-offset) / 4 * 4
                             check(count > 0); input.put(bytes,offset,count)
-                            encoder.queueInputBuffer(index,0,count,samples * 1_000_000 / 48000,0)
+                            encoder.queueInputBuffer(index,0,count,samples * 1_000_000 / audioRate,0)
                             samples += count / 4; offset += count
                             drain()
                         }
@@ -169,13 +186,13 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
         if (app.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             throw SecurityException("请授权录音权限后发送媒体音频")
         }
-        val buffer = maxOf(8192, AudioRecord.getMinBufferSize(48000, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT))
+        val buffer = maxOf(8192, AudioRecord.getMinBufferSize(audioRate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT))
         val capture = AudioPlaybackCaptureConfiguration.Builder(media).addMatchingUsage(AudioAttributes.USAGE_MEDIA).addMatchingUsage(AudioAttributes.USAGE_GAME).build()
-        val record = AudioRecord.Builder().setAudioFormat(AudioFormat.Builder().setSampleRate(48000).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_IN_STEREO).build())
+        val record = AudioRecord.Builder().setAudioFormat(AudioFormat.Builder().setSampleRate(audioRate).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_IN_STEREO).build())
             .setBufferSizeInBytes(buffer).setAudioPlaybackCaptureConfig(capture).build()
         audio = record; check(record.state == AudioRecord.STATE_INITIALIZED) { "音频捕获初始化失败" }
         val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC); audioCodec = encoder
-        encoder.configure(MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 48000, 2).apply {
+        encoder.configure(MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, audioRate, 2).apply {
             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
             setInteger(MediaFormat.KEY_BIT_RATE, 128000); setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, buffer)
         }, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -189,7 +206,7 @@ open class ProjectionCapture(final override val name: String) : PhoneProjectionA
                         val input = checkNotNull(encoder.getInputBuffer(index)); input.clear()
                         val count = record.read(input, minOf(input.capacity(), buffer), AudioRecord.READ_BLOCKING)
                         check(count > 0) { "音频读取失败：$count" }
-                        encoder.queueInputBuffer(index, 0, count, samples * 1_000_000 / 48000, 0); samples += count / 4
+                        encoder.queueInputBuffer(index, 0, count, samples * 1_000_000 / audioRate, 0); samples += count / 4
                     }
                     var out = encoder.dequeueOutputBuffer(info, 0)
                     while (out >= 0) {

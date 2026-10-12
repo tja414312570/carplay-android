@@ -231,8 +231,8 @@ class Iap2CsmChannel private constructor(
         fun openController(underlying: BlockingDuplexByteStream): Iap2CsmChannel =
             Iap2CsmChannel(Iap2LinkChannel.openController(underlying))
 
-        fun openControllerTunnel(underlying: BlockingDuplexByteStream): Iap2CsmChannel =
-            Iap2CsmChannel(Iap2LinkChannel.openControllerTunnel(underlying))
+        fun openControllerTunnel(underlying: BlockingDuplexByteStream, onDiagnostic: (String) -> Unit = {}): Iap2CsmChannel =
+            Iap2CsmChannel(Iap2LinkChannel.openControllerTunnel(underlying,onDiagnostic))
 
         private const val MAX_PENDING_FRAMES = 64
         private const val MAX_PENDING_FRAME_BYTES = 1_048_576

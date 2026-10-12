@@ -30,10 +30,7 @@ import java.net.*
 import java.util.UUID
 import java.util.concurrent.*
 import java.util.concurrent.atomic.AtomicBoolean
-import javax.jmdns.JmDNS
-import javax.jmdns.ServiceInfo
-import javax.jmdns.ServiceEvent
-import javax.jmdns.ServiceListener
+import java.util.concurrent.atomic.AtomicReference
 
 class WirelessConnection(private val context: Context, private val id: String, private val selectedPeer: String,
     private val adapter: PhoneProjectionAdapter, private val settings: SettingsStore) : Closeable {
@@ -46,6 +43,8 @@ class WirelessConnection(private val context: Context, private val id: String, p
     private var negotiatedDisplay: SenderDisplay? = null
     private val contacts = mutableSetOf<Int>()
     private val bluetoothRetired = AtomicBoolean()
+    private val vehicleNetwork = VehicleNetworkOwnership()
+    private val vehicleLink = AtomicReference<Pair<Network,LinkProperties>?>()
     private var phoneService: RegisteredRfcommService<BluetoothServerSocket>? = null
     private var phoneListener: BluetoothServerSocket? = null
     private fun <T : AutoCloseable> own(resource: T): T {
@@ -219,7 +218,7 @@ class WirelessConnection(private val context: Context, private val id: String, p
                 resources.remove(session)
                 receiverStop.set(true)
                 check(!closed.get()) { "连接已停止" }
-                Diagnostics.event("INFO","匹配已观察的 GM A2LL 固件：车机重新检测，允许一次新 iAP2 会话；保留同一 RFCOMM，重新验证身份，剩余控制预算=${recovery.remainingMillis()}ms",id)
+                Diagnostics.event("INFO","匹配已观察的 GM 固件(${bootstrap.accessoryVersionInfo()?.model ?: "A2LL/E2LB"})：车机重新检测，允许一次新 iAP2 会话；保留同一 RFCOMM，重新验证身份，剩余控制预算=${recovery.remainingMillis()}ms",id)
                 stage(Stage.IDENTIFY,"车机要求重新检测，正在重新识别和认证（1/1）")
                 session = openBluetoothSession(bluetoothLink.transport.open(failure.initialInput()), bluetoothLink.profile, 2)
                 check(session.awaitPhoneBluetoothReady(bluetoothLink.profile, recovery.remainingMillis())) {
@@ -275,6 +274,7 @@ class WirelessConnection(private val context: Context, private val id: String, p
             } else detail
         }
         stage(Stage.NETWORK, "加入车机 WLAN 热点")
+        val verifiedBluetoothIdentity = checkNotNull(bootstrap.accessoryIdentityFingerprint())
         val network = join(initial, bootstrap.accessoryVersionInfo())
         stage(Stage.DISCOVERY, "发布手机控制服务，确认车机投屏端点")
         // Use the same immutable phone transport value as 4300; keep the crypto UUID separate.
@@ -330,15 +330,20 @@ class WirelessConnection(private val context: Context, private val id: String, p
                 val tcp = own(Socket())
                 try {
                     network.bindSocket(tcp)
-                    tcp.connect(InetSocketAddress(target,targetPort),remaining.toInt())
-                    receiver = target; connected = tcp
+                    val properties = selectedLink(network)
+                    val route = PeerAddresses.resolve(listOf(checkNotNull(target.hostAddress)),properties.linkAddresses.map { it.address },interfaceIndex(properties)).firstOrNull()
+                        ?: error("选定 Wi-Fi 没有匹配车机的本地地址")
+                    tcp.bind(InetSocketAddress(route.local,0))
+                    tcp.connect(InetSocketAddress(route.remote,targetPort),remaining.toInt())
+                    Diagnostics.event("INFO","车机 TCP 已固定：network=${network.networkHandle}，interface=${properties.interfaceName}，IPv6=${tcp.localAddress is Inet6Address}，port=$targetPort；默认网络变化不改变此绑定",id)
+                    receiver = route.remote; connected = tcp
                     break
                 } catch (failure: java.io.IOException) {
                     tcp.close(); resources.remove(tcp); lastFailure = failure
                 }
             }
             connected ?: throw java.io.IOException("车机服务连接失败或超时，已使用所选 Wi-Fi 网络",lastFailure)
-        }, { network.bindSocket(it) }, object : SenderEvents {
+        }, { network.bindSocket(it); Diagnostics.event("INFO","车机 UDP 已固定：network=${network.networkHandle}",id) }, object : SenderEvents {
             override fun diagnostic(message: String) { Diagnostics.event("INFO",message,id) }
             override fun display(display: SenderDisplay) {
                 negotiatedDisplay = display
@@ -358,14 +363,18 @@ class WirelessConnection(private val context: Context, private val id: String, p
             }
             override fun dropped(count: Long) { repeat(count.toInt()) { Diagnostics.video(id,0,true) } }
             override fun audioSent() { Diagnostics.audio(id) }
+            override fun audioFormat(format: SenderAudioFormat) { adapter.configureAudio(format.sampleRate,format.channels) }
+            override fun bluetoothControlAvailable(): Boolean = !closed.get() && !bluetoothRetired.get() &&
+                !session.isClosed && bootstrap.status().authenticated && bootstrap.status().endpointReceived &&
+                bootstrap.accessoryIdentityFingerprint() == verifiedBluetoothIdentity
             override fun iapControl(stream: BlockingDuplexByteStream): CompletableFuture<Unit> {
                 val completion = CompletableFuture<Unit>()
                 own(AutoCloseable { completion.cancel(true) })
                 val runtime = own(Iap2Session.controllerTunnel(stream) { Diagnostics.event("TRACE",it.lineSequence().first(),id) })
-                val expectedIdentity = checkNotNull(bootstrap.accessoryIdentityFingerprint())
+                val expectedIdentity = verifiedBluetoothIdentity
                 val worker = Thread({
                     try {
-                        check(runtime.awaitReady(15000)) { "Wi-Fi iAP2 链路同步超时" }
+                        check(runtime.awaitReady(15000)) { "Wi-Fi iAP2 链路同步超时；${(stream as? PhoneIapTunnel)?.diagnosticSummary().orEmpty()}" }
                         val ready = AtomicBoolean()
                         stage(Stage.PAIRING,"Wi-Fi 控制通道已同步，正在独立识别和验证车机")
                         val control = PhoneBootstrap(identity.id,trust::validate,trust::verifyAuthentication,runtime::send,
@@ -411,7 +420,11 @@ class WirelessConnection(private val context: Context, private val id: String, p
         }, { settings.savePair(selectedPeer,it) }, if (peerKey == null && peerPairingIdentity == null) { wire ->
             Diagnostics.event("INFO","车机使用旧版认证，验证其证书链和 MFiSAP 签名",id)
             MfiController.authenticate({ bytes -> wire.request("POST","/auth-setup",bytes,mapOf("Content-Type" to "application/octet-stream")).body },trust)
-        } else null))
+        } else null, localAddress = {
+            val properties = selectedLink(network)
+            PeerAddresses.resolve(listOf(checkNotNull(checkNotNull(receiver).hostAddress)),properties.linkAddresses.map { it.address },interfaceIndex(properties)).firstOrNull()?.local
+                ?: error("车机 UDP 没有匹配的 Wi-Fi 本地地址")
+        }))
         sender = channel
         adapter.setObserver(object : ProjectionObserver {
             override fun videoConfig(avcC: ByteArray) { channel.config(avcC) }
@@ -422,6 +435,8 @@ class WirelessConnection(private val context: Context, private val id: String, p
         channel.start(port,settings.audio)
         while (!closed.get()) {
             errors.poll(1,TimeUnit.SECONDS)?.let { throw it }
+            if (!bluetoothRetired.get()) check(!session.isClosed && bootstrap.status().authenticated &&
+                bootstrap.accessoryIdentityFingerprint() == verifiedBluetoothIdentity) { "保留的蓝牙控制身份发生变化或已失效" }
             val update = configuration.poll()
             if (update != null) check(config.merge(update) == config) { "连接期间端点发生变化，请重新连接" }
         }
@@ -559,15 +574,18 @@ class WirelessConnection(private val context: Context, private val id: String, p
                 WifiAuthentication.WPA3 -> setWpa3Passphrase(config.password)
             }
         }.build()
-        var selectedNetwork: Network? = null
         fun onAddresses(network: Network, properties: LinkProperties?) {
             if (closed.get() || properties == null) return
+            if (vehicleNetwork.handle == network.networkHandle) {
+                vehicleLink.set(network to properties)
+                Diagnostics.event("INFO","车机 Wi-Fi 属性更新：network=${network.networkHandle}，interface=${properties.interfaceName}，addresses=${properties.linkAddresses.size}，routes=${properties.routes.size}；默认网络不改变此会话归属",id)
+            }
             val locals = properties.linkAddresses.map { it.address }
             val ready = if (config.addresses.isEmpty()) locals.any { !it.isLoopbackAddress && !it.isAnyLocalAddress }
                 else PeerAddresses.resolve(config.addresses,locals,interfaceIndex(properties)).isNotEmpty()
             if (ready) synchronized(result) {
-                if (!result.isDone) {
-                    selectedNetwork = network
+                if (!result.isDone && vehicleNetwork.select(network.networkHandle)) {
+                    vehicleLink.set(network to properties)
                     Diagnostics.event("INFO","WLAN 实际已连接：interface=${properties.interfaceName}，ifIndex=${interfaceIndex(properties)}，IPv4=${locals.any { it is Inet4Address }}，IPv6=${locals.any { it is Inet6Address }}；车机 TCP/UDP 绑定此网络",id)
                     result.complete(network)
                 }
@@ -575,29 +593,52 @@ class WirelessConnection(private val context: Context, private val id: String, p
         }
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                onAddresses(network,connectivity.getLinkProperties(network))
+                if (!closed.get() && vehicleNetwork.replaced(network.networkHandle)) {
+                    Diagnostics.event("ERROR","车机 Wi-Fi 请求更换网络：旧=${vehicleNetwork.handle}，新=${network.networkHandle}；已建立的 socket 不能自动迁移，请重新连接",id)
+                    errors.offer(IllegalStateException("车机 Wi-Fi 网络实例已更换，请重新连接")); close(); return
+                }
+                if (!closed.get()) Diagnostics.event("INFO","车机 Wi-Fi 请求获得网络：network=${network.networkHandle}，等待该请求的真实 LinkProperties",id)
             }
             override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) {
                 onAddresses(network,properties)
             }
-            override fun onUnavailable() { result.completeExceptionally(IllegalStateException("无线网络请求被拒绝或超时")) }
+            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                if (!closed.get()) Diagnostics.event("INFO","车机网络能力：network=${network.networkHandle}，${networkCapabilities(capabilities)}",id)
+            }
+            override fun onUnavailable() { if (!closed.get()) result.completeExceptionally(IllegalStateException("无线网络请求被拒绝或超时")) }
             override fun onLost(network: Network) {
-                if (!closed.get() && synchronized(result) { selectedNetwork == network }) {
+                if (!closed.get() && vehicleNetwork.lost(network.networkHandle,NetworkLossSource.CAR_REQUEST)) {
+                    Diagnostics.event("ERROR","选定车机 Wi-Fi 请求实际失去网络：network=${network.networkHandle}；结束本会话",id)
                     errors.offer(IllegalStateException("车机无线网络断开")); close()
                 }
             }
         }
         own(AutoCloseable { runCatching { connectivity.unregisterNetworkCallback(callback) }; result.cancel(true) })
+        val defaultCallback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) { if (!closed.get()) Diagnostics.event("INFO","默认网络可用：network=${network.networkHandle}，车机网络=${vehicleNetwork.handle}；车机 socket 继续固定 Wi-Fi",id) }
+            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                if (!closed.get()) Diagnostics.event("INFO","默认网络能力：network=${network.networkHandle}，${networkCapabilities(capabilities)}；外网使用此默认路由",id)
+            }
+            override fun onLost(network: Network) {
+                if (!closed.get()) Diagnostics.event("INFO","默认网络变化：旧 network=${network.networkHandle}，保留车机网络=${vehicleNetwork.handle}",id)
+            }
+        }
+        connectivity.registerDefaultNetworkCallback(defaultCallback)
+        own(AutoCloseable { runCatching { connectivity.unregisterNetworkCallback(defaultCallback) } })
         val cellularRequest = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR).addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build()
         val cellularCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Diagnostics.event("INFO", "移动蜂窝数据通道保持活跃，手机对外网络正常", id)
+                if (!closed.get()) Diagnostics.event("INFO", "蜂窝网络可用：network=${network.networkHandle}；不修改车机 Wi-Fi 绑定", id)
             }
+            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                if (!closed.get()) Diagnostics.event("INFO","蜂窝网络能力：network=${network.networkHandle}，${networkCapabilities(capabilities)}",id)
+            }
+            override fun onLost(network: Network) { if (!closed.get()) Diagnostics.event("INFO","蜂窝网络已不可用：network=${network.networkHandle}；车机 Wi-Fi 保持独立",id) }
         }
         runCatching {
             connectivity.requestNetwork(cellularRequest, cellularCallback)
             own(AutoCloseable { runCatching { connectivity.unregisterNetworkCallback(cellularCallback) } })
-        }
+        }.onFailure { Diagnostics.event("WARN","蜂窝保活请求未接受：${it.javaClass.simpleName}；外网继续使用系统默认路由",id) }
         val request = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).setNetworkSpecifier(spec).build()
         connectivity.requestNetwork(request,callback,45000)
         return result.get(50,TimeUnit.SECONDS)
@@ -606,51 +647,54 @@ class WirelessConnection(private val context: Context, private val id: String, p
     private fun interfaceIndex(link: LinkProperties): Int =
         link.interfaceName?.let { NetworkInterface.getByName(it)?.index } ?: 0
 
+    private fun selectedLink(network: Network): LinkProperties = checkNotNull(vehicleLink.get()?.takeIf { it.first == network }?.second) { "选定车机 Wi-Fi 地址尚未就绪" }
+    private fun networkCapabilities(value: NetworkCapabilities): String =
+        "wifi=${value.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)} cellular=${value.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)} vpn=${value.hasTransport(NetworkCapabilities.TRANSPORT_VPN)} internet=${value.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)} validated=${value.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)}"
+
     private fun discover(network: Network, config: WirelessEndpoint, transport: String): ReceiverRoute {
-        val connectivity = context.getSystemService(ConnectivityManager::class.java)
-        val link = checkNotNull(connectivity.getLinkProperties(network)) { "无线网络地址尚未就绪" }
+        val link = selectedLink(network)
         val candidates = link.linkAddresses.map { it.address }.filter { !it.isLoopbackAddress && !it.isAnyLocalAddress }
         val direct = PeerAddresses.resolve(config.addresses,candidates,interfaceIndex(link))
         val address = direct.firstOrNull()?.local ?: candidates.firstOrNull { it is Inet4Address } ?: candidates.firstOrNull() ?: error("车机网络未分配有效地址")
-        val controlListener = own(ServerSocket()).apply { bind(InetSocketAddress(address,0)); soTimeout = 1000 }
+        val controlListener = own(VehicleControlServer(network,address))
+        Diagnostics.event("INFO","车机控制监听已固定：network=${network.networkHandle}，interface=${link.interfaceName}，IPv6=${address is Inet6Address}，port=${controlListener.localPort}",id)
         val multicast = context.getSystemService(WifiManager::class.java).createMulticastLock("carplay-mdns").apply { setReferenceCounted(false); acquire() }
         own(AutoCloseable { if (multicast.isHeld) multicast.release() })
         val found = CompletableFuture<ReceiverRoute>()
-        val dns = try {
-            own(JmDNS.create(address,"CarPlay Android")).also {
-                it.registerService(ServiceInfo.create("_carplay-ctrl._tcp.local.","CarPlay Android",controlListener.localPort,0,0,mapOf("id" to transport,"srcvers" to "320.17")))
-            }
+        val bonjour = own(VehicleBonjour(context,network,address,controlListener.localPort,transport,
+            { Diagnostics.event("INFO",it,id) }, { addresses,port,attributes ->
+                if (!closed.get() && port in 1..65535) {
+                    val targets = PeerAddresses.resolve(addresses.mapNotNull { it.hostAddress },candidates,interfaceIndex(link))
+                        .filter { config.addresses.isEmpty() || PeerAddresses.matches(config.addresses,it.remote) }
+                    val advertised = attributes["deviceid"]?.toString(Charsets.UTF_8)
+                    val receiverId = config.receiverId
+                    if (targets.isNotEmpty() && (receiverId == null || advertised?.replace(":","")?.equals(receiverId.replace(":",""),true) == true)) {
+                        found.complete(ReceiverRoute(targets.map { it.remote },config.port ?: port,attributes["pk"]?.toString(Charsets.UTF_8)))
+                    }
+                }
+            }, { error ->
+                if (!closed.get()) {
+                    Diagnostics.event("WARN","车机 Bonjour 操作失败：${error.message}",id)
+                    if (direct.isEmpty() || config.port == null) found.completeExceptionally(error)
+                }
+            }))
+        try {
+            bonjour.start()
         } catch (failure: java.io.IOException) {
+            bonjour.close()
             if (direct.isEmpty() || config.port == null) throw failure
             Diagnostics.event("WARN","手机 Bonjour 发布失败：${failure.javaClass.simpleName}；使用已认证 iAP2 端点直连",id)
-            null
         }
-        dns?.addServiceListener("_airplay._tcp.local.",object : ServiceListener {
-            override fun serviceAdded(event: ServiceEvent) { dns.requestServiceInfo(event.type,event.name,true) }
-            override fun serviceRemoved(event: ServiceEvent) {}
-            override fun serviceResolved(event: ServiceEvent) {
-                if (closed.get()) return
-                val info = event.info
-                if (info.port !in 1..65535) return
-                val targets = PeerAddresses.resolve(info.inetAddresses.mapNotNull { it.hostAddress },candidates,interfaceIndex(link))
-                    .filter { config.addresses.isEmpty() || PeerAddresses.matches(config.addresses,it.remote) }
-                if (targets.isEmpty()) return
-                val receiverId = config.receiverId
-                if (receiverId != null && info.getPropertyString("deviceid")?.replace(":","")?.equals(receiverId.replace(":",""),true) != true) return
-                found.complete(ReceiverRoute(targets.map { it.remote },config.port ?: info.port,info.getPropertyString("pk")))
-            }
-        })
         val invitation = Thread({
             try {
                 while (!closed.get()) {
                     val socket = try { controlListener.accept() } catch (_: SocketTimeoutException) { continue }
                     try {
                         own(socket).use {
-                            it.soTimeout = 5000
-                            if (config.addresses.isNotEmpty() && !PeerAddresses.matches(config.addresses,it.inetAddress)) {
+                            if (config.addresses.isNotEmpty() && !PeerAddresses.matches(config.addresses,it.remoteAddress)) {
                                 Diagnostics.event("WARN","忽略非已认证车机地址的控制邀请",id)
                             } else {
-                                val wire = RtspWire(it)
+                                val wire = it.wire()
                                 val request = wire.next()
                                 val accepted = request.firstLine.startsWith("GET /ctrl-int/1/connect ")
                                 wire.respond(request,null,if (accepted) 200 else 400)
@@ -727,6 +771,7 @@ class WirelessConnection(private val context: Context, private val id: String, p
     }
     override fun close() {
         if (!closed.compareAndSet(false,true)) return
+        vehicleNetwork.close()
         resources.reversed().forEach { runCatching { it.close() } }; resources.clear()
         receiverThread?.interrupt()
         runBlocking { adapter.stopProjection() }

@@ -155,7 +155,7 @@ class Iap2Session private constructor(
         fun controllerTunnel(
             underlying: BlockingDuplexByteStream,
             onTrace: (String) -> Unit = {},
-        ): Iap2Session = Iap2Session(Iap2CsmChannel.openControllerTunnel(underlying), "phone-wifi", onTrace)
+        ): Iap2Session = Iap2Session(Iap2CsmChannel.openControllerTunnel(underlying) { onTrace("IAP2 LINK [phone-wifi] $it") }, "phone-wifi", onTrace)
 
         private const val DEFAULT_SEND_TIMEOUT_MILLIS = 5_000L
 

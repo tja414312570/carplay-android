@@ -2,11 +2,13 @@
 
 ## 目标和构建产物
 
-目标是替换 vivo 使用的 CarLife 组件，发送无线 CarPlay。组件版包名为 `com.baidu.carlife.vivo`，版本代码 `100033`，版本名称 `8.8.4-carplay.0.27`。独立发送版保留在 `standalone` flavor。
+目标是替换 vivo 使用的 CarLife 组件，发送无线 CarPlay。组件版包名为 `com.baidu.carlife.vivo`，版本代码 `100034`，版本名称 `8.8.4-carplay.0.28`。独立发送版保留在 `standalone` flavor。
 
-构建：`./gradlew :app:assembleVivoComponentDebug`。组件 APK 位于 `app/build/outputs/apk/vivoComponent/debug/carplay-0.27.apk`。文件名模板为 `carplay-<版本号>.apk`，两个 flavor 的目录彼此独立。Android 原有签名、宿主权限和 UID 检查继续执行；宿主是否接纳组件需要真机验证。
+构建：`./gradlew :app:assembleVivoComponentDebug`。组件 APK 位于 `app/build/outputs/apk/vivoComponent/debug/carplay-0.28.apk`。文件名模板为 `carplay-<版本号>.apk`，两个 flavor 的目录彼此独立。Android 原有签名、宿主权限和 UID 检查继续执行；宿主是否接纳组件需要真机验证。
 
-0.27 最新交付：`artifacts/carplay-0.27.apk`，SHA-256 `78862dbfd068cd4ee023b0ab041095608a5ca2fb9a400f177735ebcf705447da`。组件身份和本机 debug 签名保持不变；新增“授权系统录屏后连接”，显式授权优先选择原有 MediaProjection 编码路径。默认原生路径保留，并在宿主 ComponentVerifier 拒绝时明确报错，停止无 interface token 的重试。此版本没有使宿主签名校验失效，也未证明实车首帧成功。详见 [修复映射与验证](vivo-host-capture-0.27.md)。
+0.28 最新交付：`artifacts/carplay-0.28.apk`，SHA-256 `02fd21811c7617ea2115546dccba07a97c010711d46cf2dad3e2f215cbf1cdd5`。按实际协商选择控制通道，未接受 type 130 时保留仍有效的已认证蓝牙控制；补齐控制返回数据接收、Wi-Fi 路由隔离与诊断、AAC type 100/102 和 44.1/48 kHz 协商、Surface 帧率约束。281 项回归通过，两种构建、Lint 和验签通过；实车流量切换稳定性仍待新日志确认。详见 [0.28 修复与验证](wireless-repair-0.28.md)。
+
+0.27 历史交付：`artifacts/carplay-0.27.apk`，SHA-256 `78862dbfd068cd4ee023b0ab041095608a5ca2fb9a400f177735ebcf705447da`。组件身份和本机 debug 签名保持不变；新增“授权系统录屏后连接”，显式授权优先选择原有 MediaProjection 编码路径。默认原生路径保留，并在宿主 ComponentVerifier 拒绝时明确报错，停止无 interface token 的重试。此版本没有使宿主签名校验失效，交付时未证明实车首帧成功；随后实车日志已确认系统录屏画面。详见 [修复映射与验证](vivo-host-capture-0.27.md)。
 
 2026-10-09 的旧交付副本保留在 `artifacts/carplay-vivo-carlife-8.8.4-debug.apk`，SHA-256 `327d88e779081eb90f6bb8fbc662994414f19498a3d4e2b4d357f60770dfbecd`。该副本使用与提供的 vivo v11 相同的本机 debug 签名；签名验证通过。
 

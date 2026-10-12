@@ -11,6 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
+import java.util.ArrayDeque
 
 data class SenderDisplay(val width: Int, val height: Int, val fps: Int, val uuid: String?)
 interface SenderEvents {
@@ -22,6 +23,8 @@ interface SenderEvents {
     fun sent(bytes: Int, queuedNanos: Long)
     fun dropped(count: Long)
     fun audioSent()
+    fun audioFormat(format: SenderAudioFormat)
+    fun bluetoothControlAvailable(): Boolean
     fun iapControl(stream: BlockingDuplexByteStream): CompletableFuture<Unit>
     fun failed(error: Throwable)
 }
@@ -35,11 +38,12 @@ class AirPlaySender(
     private val events: SenderEvents,
     private val savePair: (PairedAccessory) -> Unit,
     private val legacyAuthentication: ((RtspWire) -> LegacySecurity)? = null,
+    private val localAddress: () -> InetAddress? = { null },
 ) : Closeable {
     private val closed = AtomicBoolean()
     private val resources = CopyOnWriteArrayList<Closeable>()
     private val queue = VideoQueue()
-    private val clock = NtpClock(bindDatagram)
+    private val clock = NtpClock(localAddress,bindDatagram)
     private val modes = SessionModes()
     private var control: RtspWire? = null
     private var video: Socket? = null
@@ -56,6 +60,33 @@ class AirPlaySender(
     private val touchDevices = mutableMapOf<String,HidInput>()
     private val keyDevices = mutableMapOf<String,HidKeys>()
     @Volatile private var iap: PhoneIapTunnel? = null
+    private var commandModes = false
+    private var selectedAudio: SenderAudioFormat? = null
+    private val iapLock = Any()
+    private var openingIap = false
+    private val earlyIap = ArrayDeque<ByteArray>()
+    private var earlyIapBytes = 0
+
+    private fun receiveIap(data: ByteArray): Boolean = synchronized(iapLock) {
+        if (closed.get()) return@synchronized false
+        iap?.let { return@synchronized it.offer(data) }
+        if (!openingIap) return@synchronized false
+        check(data.size <= 1_048_576 - earlyIapBytes) { "iAP 启动接收队列超出限制" }
+        earlyIap.addLast(data.copyOf()); earlyIapBytes += data.size
+        true
+    }
+
+    private fun receiveIapResponse(message: ControlMessage, typedOnly: Boolean) {
+        if (message.body.isEmpty()) return
+        val decoded = try { BplistCodec.decode(message.body) } catch (error: Exception) {
+            if (typedOnly) return
+            throw java.net.ProtocolException("iAP 命令响应不是有效 plist").apply { initCause(error) }
+        }
+        if (typedOnly && (decoded as? Map<*, *>)?.get("type") != "iAPSendMessage") return
+        val received = IapCommandData.payload(decoded,response = true)
+        if (received != null) check(receiveIap(received)) { "iAP 响应数据未被控制通道接收" }
+        events.diagnostic("iAP 命令回复：bodyBytes=${message.body.size}，字段数=${(decoded as? Map<*, *>)?.size ?: 0}，控制字节=${received?.size ?: 0}")
+    }
 
     private fun <T : Closeable> own(resource: T): T {
         resources += resource
@@ -104,42 +135,63 @@ class AirPlaySender(
             while (!closed.get()) {
                 val command = eventWire.next()
                 if (command.status == null) { val reply = handleCommand(command.body); eventWire.respond(command,reply.body,reply.status) }
+                else if (command.status in 200..299) receiveIapResponse(command,typedOnly = true)
             }
         }
         wire.onRequest = { handleCommand(it.body) }
+        wire.onResponse = { receiveIapResponse(it,typedOnly = true) }
+        synchronized(iapLock) { openingIap = true }
         val seed = SecureRandom().nextLong().and(Long.MAX_VALUE)
-        val iapReply = runCatching {
-            streams(wire.request("SETUP", "/", encode(mapOf("streams" to listOf(mapOf(
+        val iapReply = plist(wire.request("SETUP", "/", encode(mapOf("streams" to listOf(mapOf(
                 "type" to 130, "clientTypeUUID" to IAP_DATASTREAM_UUID,
                 "seed" to seed, "streamConnectionID" to seed,
-            )))), plistHeaders).body).firstOrNull { number(it["type"]) == 130 }
-        }.getOrNull()
-
-        val tunnel: PhoneIapTunnel
-        val iapPort = iapReply?.get("dataPort")?.let { runCatching { number(it) }.getOrNull() }?.takeIf { it in 1..65535 }
-        if (iapPort != null) {
-            events.diagnostic("车机支持 type 130 独立数据流 (port=$iapPort)")
-            tunnel = own(PhoneIapTunnel(own(connect(iapPort)).apply { tcpNoDelay = true },
+            )))), plistHeaders).body)
+        val transport = synchronized(iapLock) {
+            val selectedTransport = SenderNegotiation.control(iapReply)
+            if (selectedTransport.kind == SenderControlKind.AUTHENTICATED_BLUETOOTH && earlyIap.isNotEmpty()) {
+                events.diagnostic("已收到车机实际发起的 iAP 命令；建立命令控制通道并执行独立验证")
+                SenderControlTransport(SenderControlKind.WIFI_COMMAND)
+            } else selectedTransport.also { if (it.kind == SenderControlKind.AUTHENTICATED_BLUETOOTH) openingIap = false }
+        }
+        events.diagnostic("type 130 协商结果：${transport.kind}，回复字段数=${iapReply.size}")
+        commandModes = transport.kind != SenderControlKind.WIFI_DATASTREAM
+        val tunnel = when (transport.kind) {
+            SenderControlKind.WIFI_DATASTREAM -> own(PhoneIapTunnel(own(connect(checkNotNull(transport.port))).apply { tcpNoDelay = true },
                 key("DataStream-Salt$seed", "DataStream-Output-Encryption-Key")))
-        } else {
-            events.diagnostic("车机未提供 type 130 独立端口，使用 RTSP POST /command iAPSendMessage 传输")
-            tunnel = own(PhoneIapTunnel(sendHandler = { data ->
+            SenderControlKind.WIFI_COMMAND -> own(PhoneIapTunnel(sendHandler = { data ->
                 wire.request("POST", "/command", encode(mapOf(
                     "type" to "iAPSendMessage",
                     "params" to mapOf("data" to data)
-                )), plistHeaders)
+                )), plistHeaders) { receiveIapResponse(it,typedOnly = false) }
             }))
+            SenderControlKind.AUTHENTICATED_BLUETOOTH -> {
+                check(events.bluetoothControlAvailable()) { "车机未接受 type 130，且已认证的蓝牙控制通道不可用" }
+                events.diagnostic("车机未接受 type 130；保留实际已认证的蓝牙控制，Wi-Fi 媒体继续使用配对验证后的加密连接")
+                null
+            }
         }
-        iap = tunnel
-        val controlReady = events.iapControl(tunnel)
-        own(Closeable { controlReady.cancel(true) })
+        synchronized(iapLock) {
+            check(!closed.get()) { "iAP 通道建立前会话已关闭" }
+            iap = tunnel; openingIap = false
+            while (earlyIap.isNotEmpty()) check(tunnel?.offer(earlyIap.removeFirst()) == true) { "启动 iAP 数据未能交接" }
+            earlyIapBytes = 0
+        }
+        val controlReady = tunnel?.let(events::iapControl)
+        controlReady?.let { own(Closeable { it.cancel(true) }) }
 
-        if (iapPort != null) {
+        if (transport.kind == SenderControlKind.WIFI_DATASTREAM) {
             events.diagnostic("Wi-Fi iAP2 控制通道已建立，等待独立识别和认证后再启动媒体")
-            controlReady.get(45, TimeUnit.SECONDS)
+            checkNotNull(controlReady).get(45, TimeUnit.SECONDS)
             check(!closed.get()) { "Wi-Fi iAP2 认证完成前连接已停止" }
         }
 
+        if (enableAudio) {
+            check(legacy == null) { "此旧版车机的音频加密格式尚未支持，请关闭音频重试" }
+            selectedAudio = SenderNegotiation.audio(info).also {
+                events.diagnostic("音频协商：type=${it.streamType}，AAC-LC ${it.sampleRate} Hz / ${it.channels} 声道，按车机 audioOutputFormats 选择")
+                events.audioFormat(it)
+            }
+        }
         events.display(selected)
         val connection = SecureRandom().nextLong().and(Long.MAX_VALUE)
         val stream = linkedMapOf<String, Any>("type" to 110, "streamConnectionID" to connection, "width" to selected.width, "height" to selected.height)
@@ -149,10 +201,10 @@ class AirPlaySender(
         val dataPort = number(screen["dataPort"]); require(dataPort in 1..65535)
         videoKey = key("DataStream-Salt$connection", "DataStream-Output-Encryption-Key")
         video = own(connect(dataPort))
-        if (enableAudio) { check(legacy == null) { "此旧版车机的音频加密格式尚未支持，请关闭音频重试" }; setupAudio(wire, info, shared, socket.inetAddress) }
+        if (enableAudio) setupAudio(wire,checkNotNull(selectedAudio),shared,socket.inetAddress)
         wire.request("RECORD", "/")
 
-        if (iapPort == null) {
+        if (commandModes) {
             runCatching {
                 wire.request("POST", "/command", encode(modes.snapshot()), plistHeaders)
                 events.diagnostic("已发送初始 modesChanged 控制命令")
@@ -182,25 +234,21 @@ class AirPlaySender(
             while (!closed.get()) { Thread.sleep(3000); if (!closed.get()) wire.request("POST", "/feedback") }
         }
 
-        if (iapPort == null) {
+        if (transport.kind == SenderControlKind.WIFI_COMMAND) {
             events.diagnostic("Wi-Fi 媒体已 RECORD，等待 Wi-Fi iAP2 独立识别和认证完成")
-            controlReady.get(45, TimeUnit.SECONDS)
+            checkNotNull(controlReady).get(45, TimeUnit.SECONDS)
             check(!closed.get()) { "Wi-Fi iAP2 认证完成前连接已停止" }
         }
 
         return selected
     }
-    private fun setupAudio(wire: RtspWire, info: Map<*, *>, shared: ByteArray, address: InetAddress) {
-        val supported = (info["audioFormats"] as? List<*>)?.mapNotNull { it as? Map<*, *> }?.any {
-            (it["type"] as? Number)?.toInt() == 100 && ((it["audioOutputFormats"] as? Number)?.toLong() ?: 0) and 0x800000L != 0L
-        } == true
-        check(supported) { "车机未支持 AAC-LC 48kHz 双声道，请关闭音频重试" }
+    private fun setupAudio(wire: RtspWire, format: SenderAudioFormat, shared: ByteArray, address: InetAddress) {
         val id = SecureRandom().nextLong().and(Long.MAX_VALUE)
-        val local = DatagramSocket(null); bindDatagram(local); local.bind(InetSocketAddress(0)); own(local)
+        val local = own(DatagramSocket(null)); bindDatagram(local); local.bind(InetSocketAddress(localAddress(),0))
         val response = streams(wire.request("SETUP", "/", encode(mapOf("streams" to listOf(mapOf(
-            "type" to 100, "audioType" to "media", "audioFormat" to 0x800000L, "framesPerPacket" to 1024,
+            "type" to format.streamType, "audioType" to "media", "audioFormat" to format.formatBits, "framesPerPacket" to 1024,
             "streamConnectionID" to id, "controlPort" to local.localPort
-        )))), plistHeaders).body).firstOrNull { number(it["type"]) == 100 } ?: error("车机拒绝音频流")
+        )))), plistHeaders).body).firstOrNull { number(it["type"]) == format.streamType } ?: error("车机拒绝协商后的音频流")
         val port = number(response["dataPort"]); require(port in 1..65535)
         audioAddress = InetSocketAddress(address, port); audioSocket = local
         audioKey = AirPlayCrypto.hkdfSha512(shared, "DataStream-Salt$id".toByteArray(), "DataStream-Output-Encryption-Key".toByteArray())
@@ -218,7 +266,7 @@ class AirPlaySender(
         if (closed.get() || !modes.ownsAudio()) return
         val key = audioKey ?: error("音频通道尚未就绪")
         val header = ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN).apply {
-            put(0x80.toByte()); put(100.toByte()); putShort((audioSequence++).toShort()); putInt((ptsUs * 48000 / 1_000_000).toInt()); putInt(audioSsrc)
+            put(0x80.toByte()); put(100.toByte()); putShort((audioSequence++).toShort()); putInt(checkNotNull(selectedAudio).rtpTimestamp(ptsUs)); putInt(audioSsrc)
         }.array()
         val nonce = AirPlayCrypto.nonce64(audioCounter++)
         val sealed = AirPlayCrypto.chachaSeal(key, nonce, aac, header.copyOfRange(4,12))
@@ -230,14 +278,16 @@ class AirPlaySender(
         val command = plist(body)
         when (command["type"]) {
             "iAPSendMessage" -> {
-                val data = (command["params"] as? Map<*, *>)?.get("data") as? ByteArray
-                return ControlReply(if (data != null && iap?.offer(data) == true) 200 else 501)
+                val data = IapCommandData.payload(command)
+                val accepted = data != null && receiveIap(data)
+                events.diagnostic("收到 iAP 控制命令：字节=${data?.size ?: 0}，已接收=$accepted")
+                return ControlReply(if (accepted) 200 else 501)
             }
             "forceKeyFrame" -> events.keyFrameRequested()
             "changeModes" -> {
                 val response = modes.change(command)
                 events.screenOwnership(modes.ownsScreen())
-                if (iap?.isCommandTunnel == true) {
+                if (commandModes) {
                     run("carplay-modes-update") {
                         runCatching { control?.request("POST", "/command", encode(modes.snapshot()), plistHeaders) }
                     }
@@ -259,6 +309,7 @@ class AirPlaySender(
     }
     override fun close() {
         if (!closed.compareAndSet(false,true)) return
+        synchronized(iapLock) { openingIap = false; earlyIap.clear(); earlyIapBytes = 0 }
         queue.close(); resources.reversed().forEach { runCatching { it.close() } }; resources.clear()
         synchronized(workers) { workers.forEach { it.interrupt() }; workers.clear() }
     }

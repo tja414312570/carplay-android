@@ -22,6 +22,14 @@ class PhoneIapTunnel(
     private var pendingBytes = 0
     private var closed = false
     private var failure: IOException? = null
+    private var txPackets = 0L
+    private var txBytes = 0L
+    private var rxPackets = 0L
+    private var rxBytes = 0L
+
+    fun diagnosticSummary(): String = synchronized(lock) {
+        "mode=${if (isCommandTunnel) "command" else "tcp+event"} txPackets=$txPackets txBytes=$txBytes rxPackets=$rxPackets rxBytes=$rxBytes pendingBytes=$pendingBytes"
+    }
 
     fun offer(bytes: ByteArray): Boolean {
         if (bytes.isEmpty()) return false
@@ -33,6 +41,7 @@ class PhoneIapTunnel(
                 overflow = true
             } else {
                 pending.addLast(bytes.copyOf()); pendingBytes += bytes.size
+                rxPackets++; rxBytes += bytes.size
             }
             lock.notifyAll()
         }
@@ -57,6 +66,7 @@ class PhoneIapTunnel(
                 } else {
                     throw IOException("Wi-Fi iAP2 通道无有效发送实现")
                 }
+                synchronized(lock) { txPackets++; txBytes += data.size }
             } catch (error: IOException) {
                 synchronized(lock) { failure = error; lock.notifyAll() }
                 socket?.close()

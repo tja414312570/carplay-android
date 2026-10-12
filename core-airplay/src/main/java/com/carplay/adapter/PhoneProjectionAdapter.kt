@@ -21,6 +21,7 @@ interface PhoneProjectionAdapter {
     val capabilities: ProjectionCapabilities
     fun setObserver(observer: ProjectionObserver)
     fun setGrant(grant: ProjectionGrant)
+    fun configureAudio(sampleRate: Int, channels: Int)
     fun requestKeyFrame()
     fun deliverMicrophone(pcm: ByteArray, sampleRate: Int, channels: Int): Boolean
     /** 适配器名称，例如 "Vivo Jovi InCar", "Xiaomi CarWith", "Generic Android" */

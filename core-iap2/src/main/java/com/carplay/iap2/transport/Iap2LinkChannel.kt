@@ -475,8 +475,8 @@ class Iap2LinkChannel private constructor(
                 .also { it.worker.start() }
 
         /** Wi-Fi phone role: the accessory initiates; TCP uses the existing zero-ack profile. */
-        fun openControllerTunnel(underlying: BlockingDuplexByteStream): Iap2LinkChannel =
-            Iap2LinkChannel(underlying, WIRED_LINK_CONFIG, initiateNegotiation = false, {})
+        fun openControllerTunnel(underlying: BlockingDuplexByteStream, onDiagnostic: (String) -> Unit = {}): Iap2LinkChannel =
+            Iap2LinkChannel(underlying, WIRED_LINK_CONFIG, initiateNegotiation = false, {}, onDiagnostic, packetDiagnostics = true)
                 .also { it.worker.start() }
 
         /**

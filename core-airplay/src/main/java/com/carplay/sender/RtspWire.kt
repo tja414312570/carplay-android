@@ -3,6 +3,8 @@ package com.carplay.sender
 import com.carplay.airplay.ControlCipher
 import java.io.Closeable
 import java.io.EOFException
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.Socket
 import java.util.ArrayDeque
 
@@ -43,7 +45,13 @@ object ControlFraming {
 }
 
 /** A single reader; control requests and responses retain their sequence identity. */
-class RtspWire(private val socket: Socket, private val trace: (String) -> Unit = {}) : Closeable {
+class RtspWire(
+    private val input: () -> InputStream,
+    private val output: () -> OutputStream,
+    private val release: () -> Unit,
+    private val trace: (String) -> Unit = {},
+) : Closeable {
+    constructor(socket: Socket, trace: (String) -> Unit = {}) : this(socket::getInputStream,socket::getOutputStream,socket::close,trace)
     private var sequence = 0L
     private var plaintext = ByteArray(0)
     private var encrypted = ByteArray(0)
@@ -51,9 +59,10 @@ class RtspWire(private val socket: Socket, private val trace: (String) -> Unit =
     private val writeLock = Any()
     var cipher: ControlCipher? = null
     var onRequest: (ControlMessage) -> ControlReply = { ControlReply(501) }
+    var onResponse: (ControlMessage) -> Unit = {}
     var session: String? = null
 
-    @Synchronized fun request(method: String, path: String, body: ByteArray = ByteArray(0), headers: Map<String, String> = emptyMap()): ControlMessage {
+    @Synchronized fun request(method: String, path: String, body: ByteArray = ByteArray(0), headers: Map<String, String> = emptyMap(), receive: ((ControlMessage) -> Unit)? = null): ControlMessage {
         require(method.matches(Regex("[A-Z_]+")) && '\r' !in path && '\n' !in path)
         val seq = ++sequence
         val all = linkedMapOf("CSeq" to seq.toString(), "User-Agent" to "AirPlay/320.17", "Content-Length" to body.size.toString())
@@ -67,6 +76,7 @@ class RtspWire(private val socket: Socket, private val trace: (String) -> Unit =
             trace("$method $path → ${message.status}, body=${message.body.size}")
             check(message.status in 200..299) { "车机拒绝 $method $path：${message.status}" }
             message.headers["session"]?.let { session = it.substringBefore(';') }
+            (receive ?: onResponse).invoke(message)
             return message
         }
     }
@@ -74,7 +84,7 @@ class RtspWire(private val socket: Socket, private val trace: (String) -> Unit =
     fun next(): ControlMessage {
         while (pending.isEmpty()) {
             val bytes = ByteArray(8192)
-            val count = socket.getInputStream().read(bytes)
+            val count = input().read(bytes)
             if (count < 0) throw EOFException("控制通道关闭")
             val part = bytes.copyOf(count)
             val active = cipher
@@ -106,7 +116,7 @@ class RtspWire(private val socket: Socket, private val trace: (String) -> Unit =
         headers.forEach { (k, v) -> require('\r' !in k && '\n' !in k && '\r' !in v && '\n' !in v) }
         val head = buildString { append(firstLine).append("\r\n"); headers.forEach { (k,v) -> append(k).append(": ").append(v).append("\r\n") }; append("\r\n") }.toByteArray(Charsets.US_ASCII)
         val bytes = head + body
-        socket.getOutputStream().write(cipher?.encrypt(bytes) ?: bytes); socket.getOutputStream().flush()
+        output().write(cipher?.encrypt(bytes) ?: bytes); output().flush()
     }
-    override fun close() { socket.close() }
+    override fun close() { release() }
 }
