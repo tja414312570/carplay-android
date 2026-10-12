@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * transmit stamps. The resulting offset and round-trip time steer a local monotonic clock onto
  * the phone's media-clock domain, which /feedback reports.
  */
-class NtpClock : Closeable {
+class NtpClock(private val configureSocket: ((DatagramSocket) -> Unit)? = null) : Closeable {
     private val running = AtomicBoolean(false)
     private val socketLock = Any()
     private val clockLock = Any()
@@ -38,11 +38,19 @@ class NtpClock : Closeable {
     fun listen(): Int {
         check(!running.getAndSet(true)) { "NtpClock is already running" }
         val bound = DatagramSocket(null)
-        bound.reuseAddress = true
-        bound.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
-        synchronized(socketLock) { socket = bound }
-        receiver = Thread(::runReceiver, "airplay-ntp-rx").apply { isDaemon = true; start() }
-        return bound.localPort
+        try {
+            configureSocket?.invoke(bound)
+            bound.reuseAddress = true
+            bound.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+            synchronized(socketLock) { socket = bound }
+            receiver = Thread(::runReceiver, "airplay-ntp-rx").apply { isDaemon = true; start() }
+            return bound.localPort
+        } catch (failure: Throwable) {
+            bound.close()
+            synchronized(socketLock) { if (socket === bound) socket = null }
+            running.set(false)
+            throw failure
+        }
     }
 
     fun start(peerAddress: InetAddress, port: Int) {

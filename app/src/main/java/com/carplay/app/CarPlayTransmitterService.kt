@@ -1,97 +1,90 @@
 package com.carplay.app
 
-import android.app.Service
-import android.bluetooth.BluetoothDevice
+import android.app.*
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.IBinder
-import android.util.Log
-import com.carplay.adapter.PhoneProjectionAdapter
-import com.carplay.iap2.catalog.Iap2Endpoints
-import com.carplay.iap2.message.Iap2CarPlayMessages
-import com.carplay.iap2.message.Iap2Messages
-import com.carplay.iap2.session.Iap2Session
-import com.carplay.iap2.transport.BluetoothRfcommDuplexStream
-import kotlinx.coroutines.*
-import java.util.UUID
+import com.carplay.adapter.ProjectionGrant
+import com.carplay.adapter.generic.ProjectionCapture
+import com.carplay.adapter.vivo.VivoHostRequest
+import com.carplay.adapter.vivo.VivoHostSurface
+import com.carplay.adapter.vivo.DeferredVivoHostSurface
+import com.carplay.app.diagnostics.*
+import java.util.concurrent.Executors
 
-/**
- * 手机端 CarPlay 无线连接后台核心服务。
- * 流程：
- * 1. 发现/连接车机蓝牙 RFCOMM (标准 UUID 00000000-deca-fade-deca-deafdecacafe 或车机特定通道)。
- * 2. 建立 iAP2 会话，发送官方标准 0x4300 CarPlayAvailability。
- * 3. 接收车机回复的 0x4301 CarPlayStartSession (解析 SSID, Password, AirPlay 端口)。
- * 4. 自动连接车机 Wi-Fi AP。
- * 5. 启动 AirPlay RTSP 投屏握手与视频流推送。
- */
 class CarPlayTransmitterService : Service() {
-    companion object {
-        private const val TAG = "CarPlayTransmitter"
-        val IAP2_RFCOMM_UUID: UUID = UUID.fromString("00000000-deca-fade-deca-deafdecacafe")
-    }
-
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private lateinit var adapter: PhoneProjectionAdapter
-
-    override fun onCreate() {
-        super.onCreate()
-        adapter = ProjectionAdapterRegistry.getBestAdapter(this)
-        Log.i(TAG, "CarPlayTransmitterService initialized with adapter: ${adapter.name}")
-    }
-
-    fun startCarPlayNegotiation(device: BluetoothDevice, bluetoothTransportComponentId: Int = 2) {
-        scope.launch {
-            try {
-                Log.i(TAG, "Connecting to car head unit via Bluetooth RFCOMM: ${device.address}")
-                val socket = device.createRfcommSocketToServiceRecord(IAP2_RFCOMM_UUID)
-                socket.connect()
-
-                val duplexStream = BluetoothRfcommDuplexStream(socket) { diag ->
-                    Log.d(TAG, "RFCOMM: $diag")
+    private val worker = Executors.newSingleThreadExecutor()
+    private val cleanup = Executors.newSingleThreadExecutor()
+    @Volatile private var connection: WirelessConnection? = null
+    @Volatile private var sessionId: String? = null
+    override fun onCreate() { super.onCreate(); Diagnostics.initialize(this) }
+    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) { stop(); stopSelf(); return START_NOT_STICKY }
+        if (intent?.action != ACTION_START || connection != null) return START_NOT_STICKY
+        val data = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra("capture",Intent::class.java) else {
+            @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>("capture")
+        }
+        val address = intent.getStringExtra("peer")
+        val hostIntent = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra("nativeHost",Intent::class.java) else {
+            @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>("nativeHost")
+        }
+        val native = if (hostIntent == null || !BuildConfig.IS_CARLIFE_COMPONENT) null else VivoHostRequest.from(hostIntent)
+        if (data == null && native == null && !BuildConfig.IS_CARLIFE_COMPONENT || address == null) { stopSelf(); return START_NOT_STICKY }
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(NotificationChannel("connection","无线投屏",NotificationManager.IMPORTANCE_LOW))
+        val open = PendingIntent.getActivity(this,0,Intent(this,MainActivity::class.java),PendingIntent.FLAG_IMMUTABLE)
+        val stop = PendingIntent.getService(this,1,Intent(this,CarPlayTransmitterService::class.java).setAction(ACTION_STOP),PendingIntent.FLAG_IMMUTABLE)
+        val notification = Notification.Builder(this,"connection").setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setContentTitle("CarPlay 无线投屏").setContentText("点击查看进度与日志").setContentIntent(open).setOngoing(true)
+            .addAction(Notification.Action.Builder(null,"停止",stop).build()).build()
+        if (Build.VERSION.SDK_INT >= 29) startForeground(10,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or if (data != null) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION else 0)
+        else startForeground(10,notification)
+        val settings = SettingsStore(this)
+        val adapter = if (!BuildConfig.IS_CARLIFE_COMPONENT) ProjectionAdapterRegistry.getBestAdapter(this) else ProjectionCapture("vivo CarLife 原生投屏")
+        if (adapter is ProjectionCapture) {
+            adapter.captureAudio = settings.audio
+            if (native != null) adapter.surfaceSource = VivoHostSurface(native)
+            else if (BuildConfig.IS_CARLIFE_COMPONENT) adapter.surfaceSource = DeferredVivoHostSurface { NativeComponentState.request }
+        }
+        if (data != null) adapter.setGrant(ProjectionGrant(intent.getIntExtra("captureResult",Activity.RESULT_CANCELED),data))
+        val suppliedId = intent.getStringExtra("sessionId")
+        val id = if (suppliedId == Diagnostics.status.value.id && Diagnostics.status.value.stage == Stage.IDLE) suppliedId else Diagnostics.begin()
+        checkNotNull(id); sessionId = id
+        Diagnostics.event("INFO","发送端版本 ${BuildConfig.VERSION_NAME}，包名 ${BuildConfig.APPLICATION_ID}，Android ${Build.VERSION.RELEASE}",id)
+        Diagnostics.event("INFO","启动来源：component=${BuildConfig.IS_CARLIFE_COMPONENT}，screenGrant=${data != null}，nativeHost=${native != null}",id)
+        native?.let { Diagnostics.event("INFO","真实宿主入口 ${it.packageName}/${it.className}，宿主版本 ${it.version}，无线类型 ${it.usbType}",id) }
+        val current = WirelessConnection(applicationContext,id,address,adapter,settings); connection = current
+        worker.execute {
+            try { current.run() } catch (error: Exception) {
+                if (connection === current) Diagnostics.stage(id,Stage.FAILED,error.message ?: error.javaClass.simpleName)
+            } finally {
+                current.close()
+                if (connection === current) {
+                    connection = null
+                    if (Diagnostics.status.value.stage != Stage.FAILED) Diagnostics.stage(id,Stage.STOPPED,"连接已结束")
+                    if (settings.autoUpload) runCatching { DiagnosticUploader.enqueue(applicationContext,id) }
+                    stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(startId)
                 }
-
-                val session = Iap2Session.client(duplexStream, "CarPlayClient") { trace ->
-                    Log.d(TAG, "iAP2: $trace")
-                }
-
-                if (!session.awaitReady(5000)) {
-                    Log.e(TAG, "iAP2 session handshake timeout")
-                    return@launch
-                }
-
-                // 1. 发送修正后的标准 0x4300 CarPlayAvailability
-                val availabilityFrame = Iap2CarPlayMessages.buildAvailability(
-                    wirelessSupported = true,
-                    bluetoothTransportComponentId = bluetoothTransportComponentId,
-                    wiredSupported = false
-                )
-                session.send(availabilityFrame)
-                Log.i(TAG, "Sent official 0x4300 CarPlayAvailability frame to car")
-
-                // 2. 接收车机发回的 0x4301 CarPlayStartSession
-                while (isActive) {
-                    val incoming = session.recv(10000) ?: continue
-                    if (incoming.messageId == Iap2Endpoints.CARPLAY_START_SESSION.id) {
-                        Log.i(TAG, "Received 0x4301 CarPlayStartSession from car!")
-                        // 解析车机 Wi-Fi 参数并触发连接
-                        onCarPlayStartSessionReceived(incoming.payload)
-                        break
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "CarPlay negotiation failed", e)
             }
         }
+        return START_NOT_STICKY
     }
-
-    private fun onCarPlayStartSessionReceived(payload: ByteArray) {
-        Log.i(TAG, "Parsing 0x4301 payload, connecting to car Wi-Fi and launching AirPlay client...")
-        // 接下来触发 Wi-Fi NetworkRequest 以及 AirPlay 连接
+    private fun stop() {
+        val old = connection; connection = null
+        if (old == null) { stopForeground(STOP_FOREGROUND_REMOVE); return }
+        val oldId = sessionId
+        sessionId?.let { Diagnostics.stage(it,Stage.STOPPED,"用户停止连接") }
+        cleanup.execute {
+            old?.close()
+            if (SettingsStore(applicationContext).autoUpload && oldId != null) runCatching { DiagnosticUploader.enqueue(applicationContext,oldId) }
+        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
     }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    override fun onDestroy() {
-        super.onDestroy()
-        scope.cancel()
+    override fun onDestroy() { stop(); worker.shutdown(); cleanup.shutdown(); super.onDestroy() }
+    companion object {
+        const val ACTION_START = "com.carplay.START"
+        const val ACTION_STOP = "com.carplay.STOP"
     }
 }

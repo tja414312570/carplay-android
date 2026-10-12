@@ -2,7 +2,7 @@ package com.carplay.airplay
 
 import android.util.Log
 import com.carplay.mfi.MfiAuthenticator
-import com.carplay.transport.BlockingDuplexByteStream
+import com.carplay.iap2.transport.BlockingDuplexByteStream
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.Closeable
@@ -337,7 +337,7 @@ class AirPlaySession(
         val report = AirPlayHid.touchReport(scaled)
         val sendStartNs = System.nanoTime()
         val sent = sendHidReport(AirPlayHid.TOUCH_HID_UID, report)
-        if (sent) com.shilapi.xcertplay.media.TouchLatencyProbe.onTouchSent(sendStartNs, System.nanoTime() - sendStartNs)
+        if (sent) com.carplay.media.TouchLatencyProbe.onTouchSent(sendStartNs, System.nanoTime() - sendStartNs)
         if (sent && firstTouchSendLogged.compareAndSet(false, true)) {
             val first = scaled.firstOrNull()
             Log.i(
@@ -433,7 +433,7 @@ class AirPlaySession(
         )
 
     private fun runControl() {
-        com.shilapi.xcertplay.network.TcpLiveness.configure(socket) { debugLog(it) }
+        com.carplay.network.TcpLiveness.configure(socket) { debugLog(it) }
         val input = BufferedInputStream(socket.getInputStream())
         val output = BufferedOutputStream(socket.getOutputStream())
         var accumulated = ByteArray(0)

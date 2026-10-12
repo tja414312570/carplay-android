@@ -1,7 +1,7 @@
 package com.carplay.airplay
 
 import android.util.Log
-import com.carplay.transport.BlockingDuplexByteStream
+import com.carplay.iap2.transport.BlockingDuplexByteStream
 import java.io.Closeable
 import java.io.File
 import java.net.Inet4Address

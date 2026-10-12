@@ -18,6 +18,7 @@ import java.util.ArrayDeque
  */
 class Iap2LinkEngine(
     private val config: Iap2LinkConfig = Iap2LinkConfig(),
+    private val onPacketMetadata: ((Iap2PacketMetadata) -> Unit)? = null,
 ) {
     enum class State {
         IDLE,
@@ -31,7 +32,7 @@ class Iap2LinkEngine(
         data class Control(val bytes: ByteArray) : Event()
         data class Session(val sessionId: Int, val bytes: ByteArray) : Event()
         data class Writable(val value: Boolean) : Event()
-        data class Dead(val reason: String?) : Event()
+        data class Dead(val reason: String?, val restartInput: ByteArray? = null) : Event()
     }
 
     data class SessionDescriptor(
@@ -124,6 +125,10 @@ class Iap2LinkEngine(
     private var state = State.IDLE
     private var peerSynchronization = localSynchronization()
     private var peerSynchronizationReceived = false
+    private var respondingToPeerSynchronization = false
+    private var localSynchronizationSequence: Int? = null
+    private var peerSynchronizationSequence: Int? = null
+    private var controlSessionId = CONTROL_SESSION_ID
     private var sentSequence = INITIAL_SEQUENCE
     private var lastSentAcknowledged: Int? = null
     private var lastReceivedInOrder = 0
@@ -148,7 +153,15 @@ class Iap2LinkEngine(
 
     fun writable(): Boolean = writable
 
+    /** All queued data has been acknowledged by the peer; this is not application acceptance. */
+    fun outboundAcknowledged(): Boolean = state == State.NORMAL && queued.isEmpty() && unacknowledged.isEmpty()
+
     fun peerSynchronization(): SynchronizationPayload = peerSynchronization
+
+    fun validatedPeerSynchronization(): SynchronizationPayload? =
+        peerSynchronization.takeIf { peerSynchronizationReceived }
+
+    fun negotiatedControlSessionId(): Int? = controlSessionId.takeIf { peerSynchronizationReceived }
 
     fun takeOutput(): ByteArray {
         val bytes = output.toByteArray()
@@ -169,9 +182,10 @@ class Iap2LinkEngine(
     fun start(wiredInitiator: Boolean, nowMillis: Long) {
         if (state != State.IDLE) return
         state = State.DETECTING
+        if (config.startup == Iap2LinkStartup.ACCESSORY_FIRST) return
         if (!appendOutput(IAP2_MARKER)) return
         markerDeadlineMillis = nowMillis + MARKER_RESEND_MILLIS
-        if (wiredInitiator && state != State.DEAD) enterNegotiating(nowMillis)
+        if (wiredInitiator && config.startup == Iap2LinkStartup.LEGACY && state != State.DEAD) enterNegotiating(nowMillis)
     }
 
     /** Supplies any received byte fragment; empty fragments are harmless. */
@@ -193,6 +207,16 @@ class Iap2LinkEngine(
             while (parseAvailable(nowMillis) && state != State.DEAD) {
                 // Drain all complete frames before accepting more input.
             }
+        }
+        // A detection marker may share this read with a new SYN. Preserve the unconsumed
+        // tail only for that explicit terminal reason, bounded like every other wire buffer.
+        val terminal = events.peekLast() as? Event.Dead
+        if (terminal?.restartInput != null && offset < bytes.size) {
+            val tailBytes = bytes.size - offset
+            events.removeLast()
+            events += if (tailBytes <= MAX_WIRE_FRAME_BYTES - terminal.restartInput.size) {
+                terminal.copy(restartInput = terminal.restartInput + bytes.copyOfRange(offset, bytes.size))
+            } else Event.Dead("iAP2 restart input limit exceeded")
         }
     }
 
@@ -244,7 +268,7 @@ class Iap2LinkEngine(
 
     /** Queues a complete raw control-session payload (session id 10). */
     fun sendControl(bytes: ByteArray, nowMillis: Long) {
-        sendSession(CONTROL_SESSION_ID, bytes, nowMillis)
+        sendSession(controlSessionId, bytes, nowMillis)
     }
 
     /** Queues one raw payload on a negotiated iAP2 session. */
@@ -264,6 +288,7 @@ class Iap2LinkEngine(
     private fun parseAvailable(nowMillis: Long): Boolean {
         if (state == State.DEAD) return false
         if (state == State.DETECTING) {
+            if (config.startup != Iap2LinkStartup.LEGACY) return parsePhoneDetection(nowMillis)
             if (receive.size < IAP2_MARKER.size) return false
             if (!receive.matches(IAP2_MARKER)) {
                 die("iAP2 marker was not received")
@@ -286,12 +311,20 @@ class Iap2LinkEngine(
                     payloadWithChecksum.copyOf(payloadWithChecksum.size - CHECKSUM_BYTES),
                     nowMillis,
                 )
-            }
+            } else reportPacket("REJECTED", pending, payloadChecksumValid = false)
             return true
         }
 
         var discarded = false
         while (receive.size >= 2 && (receive[0] != LINK_START_HIGH || receive[1] != LINK_START_LOW)) {
+            if (config.negotiateControlSession && state == State.NORMAL &&
+                receive[0] == IAP2_MARKER[0] && receive[1] == IAP2_MARKER[1]) {
+                if (receive.size < IAP2_MARKER.size) return discarded
+                if (receive.matches(IAP2_MARKER)) {
+                    die("车机在控制阶段重新发送 iAP2 检测包，旧链路已结束", receive.take(receive.size))
+                    return false
+                }
+            }
             receive.discard(1)
             discarded = true
         }
@@ -311,9 +344,43 @@ class Iap2LinkEngine(
         return true
     }
 
-    private fun enterNegotiating(nowMillis: Long) {
+    private fun parsePhoneDetection(nowMillis: Long): Boolean {
+        if (receive.size < 2) return false
+        if (receive[0] == IAP2_MARKER[0] && receive[1] == IAP2_MARKER[1]) {
+            if (receive.size < IAP2_MARKER.size) return false
+            if (receive.matches(IAP2_MARKER)) {
+                receive.discard(IAP2_MARKER.size)
+                if (config.startup == Iap2LinkStartup.ACCESSORY_FIRST) {
+                    if (!appendOutput(IAP2_MARKER)) return false
+                    // No bare phone SYN: the accessory initiates this profile.
+                    respondingToPeerSynchronization = true
+                    enterNegotiating(nowMillis, sendImmediately = false)
+                } else enterNegotiating(nowMillis)
+                return true
+            }
+        } else if (receive[0] == LINK_START_HIGH && receive[1] == LINK_START_LOW) {
+            if (receive.size < HEADER_BYTES) return false
+            val header = parseHeader(ByteArray(HEADER_BYTES) { receive[it] })
+            if (header != null && (header.control and CONTROL_RESET) != 0) {
+                die("peer sent iAP2 reset")
+                return false
+            }
+            if (header != null && header.length > HEADER_BYTES &&
+                (header.control and CONTROL_SYNCHRONIZE) != 0) {
+                // Some accessories send SYN directly, without a detection marker.
+                respondingToPeerSynchronization = true
+                enterNegotiating(nowMillis, sendImmediately = false)
+                return true
+            }
+        }
+        receive.discard(1)
+        return true
+    }
+
+    private fun enterNegotiating(nowMillis: Long, sendImmediately: Boolean = true) {
         state = State.NEGOTIATING
         markerDeadlineMillis = null
+        if (!sendImmediately) return
         sendSynchronization()
         if (state != State.DEAD) {
             synchronizationDeadlineMillis = nowMillis + SYNCHRONIZATION_RESEND_MILLIS
@@ -321,18 +388,40 @@ class Iap2LinkEngine(
     }
 
     private fun processFrame(header: Header, payload: ByteArray?, nowMillis: Long) {
+        reportPacket("RECEIVED", header)
         if ((header.control and CONTROL_RESET) != 0) {
             die("peer sent iAP2 reset")
             return
         }
+        val confirmsLocalSynchronization = localSynchronizationSequence != null &&
+            header.acknowledgement == localSynchronizationSequence
         if ((header.control and CONTROL_SYNCHRONIZE) != 0) {
-            SynchronizationPayload.decode(payload ?: ByteArray(0))?.let {
-                handleSynchronization(it, header.sequence)
+            if (config.negotiateControlSession &&
+                (payload == null || payload.size < 13 || (payload.size - SYNCHRONIZATION_FIXED_BYTES) % SESSION_DESCRIPTOR_BYTES != 0 ||
+                    u8(payload[0]) != SYNCHRONIZATION_VERSION)) {
+                die("peer iAP2 synchronization payload is malformed")
+                return
             }
+            if (config.negotiateControlSession && state == State.NORMAL) {
+                val repeated = SynchronizationPayload.decode(payload ?: ByteArray(0))
+                if (repeated != peerSynchronization || header.sequence != peerSynchronizationSequence) {
+                    die("peer changed iAP2 synchronization during an active session")
+                    return
+                }
+                if ((header.control and CONTROL_ACKNOWLEDGEMENT) != 0 && confirmsLocalSynchronization) sendAcknowledgement()
+                // A replayed handshake ACK must not replace a newer data acknowledgement.
+                return
+            }
+            SynchronizationPayload.decode(payload ?: ByteArray(0))?.let {
+                val confirmed = config.negotiateControlSession && confirmsLocalSynchronization &&
+                    (header.control and CONTROL_ACKNOWLEDGEMENT) != 0
+                handleSynchronization(it, header.sequence, nowMillis, confirmed)
+            }
+            if (state == State.DEAD) return
         }
         if ((header.control and CONTROL_ACKNOWLEDGEMENT) != 0) {
             accumulatedAcknowledgements += 1
-            handleAcknowledgement(header.acknowledgement, nowMillis)
+            handleAcknowledgement(header.acknowledgement, nowMillis, confirmsLocalSynchronization)
         }
         if ((header.control and CONTROL_EXTENDED_ACKNOWLEDGEMENT) != 0 && payload != null) {
             handleExtendedAcknowledgement(payload)
@@ -349,17 +438,31 @@ class Iap2LinkEngine(
         }
     }
 
-    private fun handleSynchronization(sync: SynchronizationPayload, sequence: Int) {
+    private fun handleSynchronization(sync: SynchronizationPayload, sequence: Int, nowMillis: Long,
+        confirmsLocalSynchronization: Boolean) {
         if (state != State.NEGOTIATING) return
+        if (config.negotiateControlSession) {
+            val control = sync.sessions.firstOrNull { it.kind == 0 && it.version == 2 && it.id != 0 }
+            if (sync.maxOutgoing == 0 || sync.maxLength <= HEADER_BYTES + CHECKSUM_BYTES || control == null) {
+                die("peer iAP2 synchronization has no usable control session")
+                return
+            }
+            controlSessionId = control.id
+        }
         peerSynchronization = sync
         peerSynchronizationReceived = true
+        peerSynchronizationSequence = sequence
         lastReceivedInOrder = sequence
         lastAcknowledgedReceived = sequence
-        sendAcknowledgement()
+        if (respondingToPeerSynchronization && !confirmsLocalSynchronization) {
+            sendSynchronization()
+            synchronizationDeadlineMillis = nowMillis + SYNCHRONIZATION_RESEND_MILLIS
+        } else sendAcknowledgement()
     }
 
-    private fun handleAcknowledgement(acknowledgement: Int, nowMillis: Long) {
+    private fun handleAcknowledgement(acknowledgement: Int, nowMillis: Long, confirmsLocalSynchronization: Boolean) {
         if (state == State.NEGOTIATING) {
+            if (config.negotiateControlSession && (!confirmsLocalSynchronization || !peerSynchronizationReceived)) return
             if (!peerSynchronizationReceived || !peerLimitsAreUsable() || queued.any { !peerPayloadIsAcceptable(it.payload) }) {
                 die("peer iAP2 maxLength cannot carry pending control packets")
                 return
@@ -367,6 +470,13 @@ class Iap2LinkEngine(
             state = State.NORMAL
             synchronizationDeadlineMillis = null
             setWritable(true)
+        }
+        if (config.maximumInFlightPackets != null && state == State.NORMAL) {
+            val previous = lastSentAcknowledged
+            if (previous != null && sequenceDistance(acknowledgement, previous) > sequenceDistance(sentSequence, previous)) {
+                // A stale ACK or one for unsent data cannot release the phone's pending queue.
+                return
+            }
         }
         lastSentAcknowledged = acknowledgement
 
@@ -383,7 +493,7 @@ class Iap2LinkEngine(
         }
         if (!rearmed) receiveAcknowledgementDeadlineMillis = null
 
-        while (sequenceDistance(sentSequence, lastSentAcknowledged) < peerSynchronization.maxOutgoing) {
+        while (sequenceDistance(sentSequence, lastSentAcknowledged) < outgoingWindowLimit()) {
             val packet = queued.pollFirst() ?: break
             sendPacket(packet, nowMillis)
             setWritable(true)
@@ -435,7 +545,7 @@ class Iap2LinkEngine(
         while (outOfOrder.isNotEmpty() && sequenceDistance(outOfOrder.first().sequence, lastReceivedInOrder) == 1) {
             val inOrder = outOfOrder.removeAt(0)
             lastReceivedInOrder = inOrder.sequence
-            if (inOrder.sessionId == CONTROL_SESSION_ID) {
+            if (inOrder.sessionId == controlSessionId) {
                 enqueueEvent(Event.Control(inOrder.payload))
             } else {
                 enqueueEvent(Event.Session(inOrder.sessionId, inOrder.payload))
@@ -454,8 +564,11 @@ class Iap2LinkEngine(
     }
 
     private fun sendPacket(packet: Packet, nowMillis: Long) {
+        val outstanding = sequenceDistance(sentSequence, lastSentAcknowledged)
+        val full = if (config.maximumInFlightPackets == null) outstanding > peerSynchronization.maxOutgoing
+            else outstanding >= outgoingWindowLimit()
         if (state != State.NORMAL ||
-            sequenceDistance(sentSequence, lastSentAcknowledged) > peerSynchronization.maxOutgoing
+            full
         ) {
             if (queued.size >= config.maximumQueuedPackets) {
                 die("iAP2 outbound queue limit exceeded")
@@ -480,6 +593,10 @@ class Iap2LinkEngine(
         }
     }
 
+    private fun outgoingWindowLimit(): Int =
+        config.maximumInFlightPackets?.let { minOf(it, peerSynchronization.maxOutgoing) }
+            ?: peerSynchronization.maxOutgoing
+
     private fun retransmitDuePacket(nowMillis: Long) {
         if (state != State.NORMAL || unacknowledged.isEmpty()) return
         val next = unacknowledged.minByOrNull { it.deadlineMillis } ?: return
@@ -495,10 +612,14 @@ class Iap2LinkEngine(
     }
 
     private fun sendSynchronization() {
-        writePacket(localSynchronization().encode(), sentSequence, CONTROL_SYNCHRONIZE, 0)
+        val control = CONTROL_SYNCHRONIZE or
+            if (respondingToPeerSynchronization && peerSynchronizationReceived) CONTROL_ACKNOWLEDGEMENT else 0
+        writePacket(localSynchronization().encode(), sentSequence, control, 0)
+        if (state != State.DEAD) localSynchronizationSequence = sentSequence
     }
 
     private fun sendAcknowledgement() {
+        // Pure ACK repeats the last sent sequence. Only a data packet advances it.
         writePacket(null, sentSequence, CONTROL_ACKNOWLEDGEMENT, 0)
     }
 
@@ -530,7 +651,14 @@ class Iap2LinkEngine(
             frame.write(payload)
             frame.write(checksum(payload, payload.size))
         }
-        appendOutput(frame.toByteArray())
+        if (appendOutput(frame.toByteArray())) reportPacket("QUEUED", Header(length, control, sequence, lastReceivedInOrder, sessionId))
+    }
+
+    private fun reportPacket(action: String, header: Header, payloadChecksumValid: Boolean = true) {
+        val observer = onPacketMetadata ?: return
+        try { observer(Iap2PacketMetadata(action, header.control, header.sequence, header.acknowledgement,
+            header.sessionId, header.length, state, payloadChecksumValid)) }
+        catch (_: Exception) { /* Header diagnostics cannot change protocol semantics. */ }
     }
 
     private fun setWritable(value: Boolean) {
@@ -539,7 +667,7 @@ class Iap2LinkEngine(
         enqueueEvent(Event.Writable(value))
     }
 
-    private fun die(reason: String?) {
+    private fun die(reason: String?, restartInput: ByteArray? = null) {
         if (state == State.DEAD) return
         markerDeadlineMillis = null
         synchronizationDeadlineMillis = null
@@ -549,7 +677,7 @@ class Iap2LinkEngine(
         writable = false
         output.reset()
         events.clear()
-        events += Event.Dead(reason)
+        events += Event.Dead(reason, restartInput)
     }
 
     private fun appendOutput(bytes: ByteArray): Boolean {
@@ -578,7 +706,7 @@ class Iap2LinkEngine(
     private fun peerPayloadIsAcceptable(payload: ByteArray): Boolean =
         peerLimitsAreUsable() && payload.size <= peerSynchronization.maxLength - HEADER_BYTES - CHECKSUM_BYTES
 
-    private fun localSynchronization() = SynchronizationPayload(
+    private fun localSynchronization() = config.synchronizationOverride ?: SynchronizationPayload(
         maxOutgoing = config.maxOutgoing,
         maxLength = MAX_WIRE_FRAME_BYTES,
         retransmissionTimeoutMillis = if (config.zeroAcknowledgements) 0 else DEFAULT_RETRANSMISSION_TIMEOUT_MILLIS,
@@ -708,6 +836,11 @@ data class Iap2LinkConfig(
     val maximumOutOfOrderPackets: Int = 64,
     val maximumPendingOutputBytes: Int = 1_048_576,
     val maximumPendingEvents: Int = 256,
+    val startup: Iap2LinkStartup = Iap2LinkStartup.LEGACY,
+    val synchronizationOverride: Iap2LinkEngine.SynchronizationPayload? = null,
+    val negotiateControlSession: Boolean = false,
+    /** Optional phone send limit; never replaces the peer's negotiated synchronization fields. */
+    val maximumInFlightPackets: Int? = null,
 ) {
     init {
         require(maxOutgoing in 0..0xff)
@@ -718,6 +851,7 @@ data class Iap2LinkConfig(
         require(maximumOutOfOrderPackets in 1..256)
         require(maximumPendingOutputBytes >= 1)
         require(maximumPendingEvents >= 1)
+        require(maximumInFlightPackets == null || maximumInFlightPackets in 1..0xff)
     }
 }
 

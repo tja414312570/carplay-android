@@ -52,6 +52,31 @@ data class Iap2ClusterAsset(
 
 /** Typed codec for the high-value CarPlay endpoints. */
 object Iap2CarPlayMessages {
+    /** Minimal wireless attributes: the optional Bluetooth identifier is omitted, never fabricated. */
+    fun buildMinimalWirelessAvailability(): Iap2Frame = Iap2Messages.buildRaw(0x4300) {
+        group(1) { u8(0, 1) }
+    }
+
+    /** Root-parameter variant observed with a link ACK in the supplied October 8 phone log. */
+    fun buildFlatWirelessAvailability(bluetoothTransportIdentifier: String): Iap2Frame = Iap2Messages.buildRaw(0x4300) {
+        u8(0, 1)
+        string(1, bluetoothTransportIdentifier)
+    }
+
+    /** vivo v11's explicit wire variant; the generic STRING schema remains unchanged. */
+    fun buildVivoReferenceAvailability(): Iap2Frame = buildWirelessComponentAvailability(2)
+
+    /** Experimental numeric reference variant; this is not the STRING field used by the standard decoder. */
+    fun buildWirelessComponentAvailability(componentId: Int): Iap2Frame {
+        require(componentId in 0..0xffff) { "Wireless CarPlay component id must fit in u16" }
+        return Iap2Messages.buildRaw(0x4300) {
+            group(1) {
+                u8(0, 1)
+                u16(1, componentId)
+            }
+        }
+    }
+
     fun startSession(
         airPlayPort: Int,
         publicKey: String,
@@ -142,24 +167,24 @@ object Iap2CarPlayMessages {
      * Builds standard 0x4300 CarPlayAvailability sent from Phone to Car.
      * Param 1: Wireless Group
      *   - Sub-param 0: CarPlaySupported (Boolean / u8 = 1)
-     *   - Sub-param 1: TransportComponentIdentifier (u16 matching car's Bluetooth component ID)
+     *   - Sub-param 1: the phone's stable transport identifier (a CSM string)
      */
     fun buildAvailability(
         wirelessSupported: Boolean = true,
-        bluetoothTransportComponentId: Int = 2,
+        bluetoothTransportIdentifier: String,
         wiredSupported: Boolean = false,
-        usbTransportComponentId: Int? = null,
+        usbTransportIdentifier: String? = null,
     ): Iap2Frame = Iap2Messages.build(Iap2Endpoints.CARPLAY_AVAILABILITY) {
-        if (wiredSupported && usbTransportComponentId != null) {
+        if (wiredSupported && usbTransportIdentifier != null) {
             group(0) {
                 u8(0, 1)
-                u16(1, usbTransportComponentId)
+                string(1, usbTransportIdentifier)
             }
         }
         if (wirelessSupported) {
             group(1) {
                 u8(0, 1)
-                u16(1, bluetoothTransportComponentId)
+                string(1, bluetoothTransportIdentifier)
             }
         }
     }

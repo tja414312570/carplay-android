@@ -1,13 +1,28 @@
 package com.carplay.adapter
 
 import android.content.Context
-import kotlinx.coroutines.flow.StateFlow
+import android.content.Intent
+
+data class ProjectionGrant(val resultCode: Int, val data: Intent)
+data class ProjectionCapabilities(val video: Boolean, val audio: Boolean, val input: Boolean, val microphone: Boolean, val detail: String)
+
+interface ProjectionObserver {
+    fun videoConfig(avcC: ByteArray)
+    fun audioFrame(aac: ByteArray, sampleTimeUs: Long)
+    fun diagnostic(message: String)
+    fun failed(error: Throwable)
+}
 
 /**
  * 厂商/平台投屏适配器接口。
  * Vivo (Jovi InCar)、小米 (CarWith)、通用 Android (MediaProjection) 均实现此接口。
  */
 interface PhoneProjectionAdapter {
+    val capabilities: ProjectionCapabilities
+    fun setObserver(observer: ProjectionObserver)
+    fun setGrant(grant: ProjectionGrant)
+    fun requestKeyFrame()
+    fun deliverMicrophone(pcm: ByteArray, sampleRate: Int, channels: Int): Boolean
     /** 适配器名称，例如 "Vivo Jovi InCar", "Xiaomi CarWith", "Generic Android" */
     val name: String
 

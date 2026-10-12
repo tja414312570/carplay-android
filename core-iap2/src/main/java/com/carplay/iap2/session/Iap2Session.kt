@@ -10,6 +10,9 @@ import com.carplay.iap2.wire.Iap2Frame
 import com.carplay.iap2.transport.BlockingDuplexByteStream
 import com.carplay.iap2.transport.Iap2CsmChannel
 import com.carplay.iap2.transport.Iap2ArtworkTransfer
+import com.carplay.iap2.transport.Iap2HandshakeStatus
+import com.carplay.iap2.transport.PhoneBluetoothProfile
+import com.carplay.iap2.transport.PhoneBluetoothHandshakeDeadline
 
 /**
  * One immediately readable and writable iAP2 CSM session.
@@ -25,10 +28,35 @@ class Iap2Session private constructor(
 ) : AutoCloseable {
     val isClosed: Boolean get() = channel.isClosed
 
+    fun handshakeStatus(): Iap2HandshakeStatus = channel.handshakeStatus()
+
+    fun awaitPhoneBluetoothReady(profile: PhoneBluetoothProfile, maximumWaitMillis: Long? = null,
+        cancelled: () -> Boolean = { false }): Boolean {
+        require(maximumWaitMillis == null || maximumWaitMillis >= 0)
+        val extraDeadline = maximumWaitMillis?.let { System.nanoTime() + minOf(it, profile.readyTimeoutMillis) * 1_000_000 }
+        val deadline = PhoneBluetoothHandshakeDeadline(profile)
+        var ready = false
+        while (!isClosed && !cancelled()) {
+            val remaining = minOf(deadline.remainingMillis(handshakeStatus()), extraDeadline?.let {
+                ((it - System.nanoTime()) / 1_000_000).coerceAtLeast(0)
+            } ?: Long.MAX_VALUE)
+            if (remaining == 0L) break
+            if (channel.awaitReady(minOf(remaining, 250))) { ready = true; break }
+        }
+        emitTrace("IAP2 READY [$traceContext] ready=$ready")
+        return ready
+    }
+
     fun awaitReady(timeoutMillis: Long): Boolean {
         val ready = channel.awaitReady(timeoutMillis)
         emitTrace("IAP2 READY [$traceContext] ready=$ready")
         return ready
+    }
+
+    fun awaitOutboundAcknowledged(timeoutMillis: Long): Boolean {
+        val acknowledged = channel.awaitOutboundAcknowledged(timeoutMillis)
+        emitTrace("IAP2 DRAIN [$traceContext] acknowledged=$acknowledged")
+        return acknowledged
     }
 
     fun send(frame: Iap2Frame, timeoutMillis: Long = DEFAULT_SEND_TIMEOUT_MILLIS) {
@@ -114,6 +142,21 @@ class Iap2Session private constructor(
     }
 
     companion object {
+        fun phoneBluetooth(underlying: BlockingDuplexByteStream, profile: PhoneBluetoothProfile,
+            onTrace: (String) -> Unit = {}): Iap2Session = Iap2Session(
+                Iap2CsmChannel.openPhoneBluetooth(underlying, profile) { onTrace("IAP2 LINK [phone/${profile.label}] $it") },
+                "phone/${profile.label}", onTrace)
+
+        fun controller(
+            underlying: BlockingDuplexByteStream,
+            onTrace: (String) -> Unit = {},
+        ): Iap2Session = Iap2Session(Iap2CsmChannel.openController(underlying), "phone", onTrace)
+
+        fun controllerTunnel(
+            underlying: BlockingDuplexByteStream,
+            onTrace: (String) -> Unit = {},
+        ): Iap2Session = Iap2Session(Iap2CsmChannel.openControllerTunnel(underlying), "phone-wifi", onTrace)
+
         private const val DEFAULT_SEND_TIMEOUT_MILLIS = 5_000L
 
         fun open(

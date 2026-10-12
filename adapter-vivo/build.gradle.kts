@@ -1,11 +1,10 @@
 plugins {
     id("com.android.library")
-    id("org.jetbrains.kotlin.android")
 }
 
 android {
     namespace = "com.carplay.adapter.vivo"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 26
@@ -15,12 +14,11 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+
 }
 
 dependencies {
+    implementation(project(":adapter-generic"))
     implementation(project(":core-iap2"))
     implementation(project(":core-airplay"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0")

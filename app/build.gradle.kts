@@ -1,20 +1,37 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
+
+val senderVersion = "0.26"
 
 android {
     namespace = "com.carplay.app"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.carplay.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 26
+        versionName = "$senderVersion.0"
     }
 
+    buildFeatures { buildConfig = true }
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("standalone") {
+            dimension = "distribution"
+            buildConfigField("boolean", "IS_CARLIFE_COMPONENT", "false")
+        }
+        create("vivoComponent") {
+            dimension = "distribution"
+            applicationId = "com.baidu.carlife.vivo"
+            versionCode = 100032
+            versionName = "8.8.4-carplay.$senderVersion"
+            buildConfigField("boolean", "IS_CARLIFE_COMPONENT", "true")
+        }
+    }
+    testOptions { unitTests.isReturnDefaultValues = true }
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -25,12 +42,21 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
+
+}
+
+androidComponents {
+    onVariants { variant ->
+        variant.outputs.forEach { output ->
+            output.outputFileName.set("carplay-$senderVersion.apk")
+        }
     }
 }
 
 dependencies {
+    implementation("org.jmdns:jmdns:3.6.3")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
     implementation(project(":core-iap2"))
     implementation(project(":core-airplay"))
     implementation(project(":adapter-vivo"))

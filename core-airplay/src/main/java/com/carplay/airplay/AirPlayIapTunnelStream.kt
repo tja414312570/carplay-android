@@ -1,6 +1,6 @@
 package com.carplay.airplay
 
-import com.carplay.transport.BlockingDuplexByteStream
+import com.carplay.iap2.transport.BlockingDuplexByteStream
 import java.io.IOException
 import java.util.ArrayDeque
 import kotlin.math.min

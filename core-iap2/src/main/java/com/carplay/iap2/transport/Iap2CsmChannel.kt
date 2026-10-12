@@ -32,6 +32,8 @@ class Iap2CsmChannel private constructor(
             closed || terminalFailure != null
         }
 
+    fun handshakeStatus(): Iap2HandshakeStatus = link.handshakeStatus()
+
     /** Waits for the underlying link to negotiate a writable session 10. */
     fun awaitReady(timeoutMillis: Long): Boolean {
         requireTimeout(timeoutMillis)
@@ -82,6 +84,14 @@ class Iap2CsmChannel private constructor(
                     failClosed(IOException("iAP2 could not queue the complete CSM frame before its timeout"))
                 }
             }
+        }
+    }
+
+    fun awaitOutboundAcknowledged(timeoutMillis: Long): Boolean {
+        requireTimeout(timeoutMillis)
+        return try { link.awaitOutboundAcknowledged(timeoutMillis) } catch (failure: Throwable) {
+            if (failure is Error) fatal(failure)
+            failClosed(failure)
         }
     }
 
@@ -215,6 +225,15 @@ class Iap2CsmChannel private constructor(
     }
 
     companion object {
+        fun openPhoneBluetooth(underlying: BlockingDuplexByteStream, profile: PhoneBluetoothProfile,
+            onDiagnostic: (String) -> Unit = {}): Iap2CsmChannel =
+            Iap2CsmChannel(Iap2LinkChannel.openPhoneBluetooth(underlying, profile, onDiagnostic))
+        fun openController(underlying: BlockingDuplexByteStream): Iap2CsmChannel =
+            Iap2CsmChannel(Iap2LinkChannel.openController(underlying))
+
+        fun openControllerTunnel(underlying: BlockingDuplexByteStream): Iap2CsmChannel =
+            Iap2CsmChannel(Iap2LinkChannel.openControllerTunnel(underlying))
+
         private const val MAX_PENDING_FRAMES = 64
         private const val MAX_PENDING_FRAME_BYTES = 1_048_576
         private const val NANOS_PER_MILLISECOND = 1_000_000L

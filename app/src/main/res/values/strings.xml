@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">CarPlay 无线发送端</string>
+    <string name="input_description">在您主动投屏时执行来自已连接车机的触控和返回、主页操作。可以随时关闭此服务。</string>
+</resources>

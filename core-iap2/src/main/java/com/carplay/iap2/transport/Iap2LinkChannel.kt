@@ -21,6 +21,8 @@ class Iap2LinkChannel private constructor(
     private val linkConfig: Iap2LinkConfig,
     private val initiateNegotiation: Boolean,
     private val onArtwork: (Iap2ArtworkTransfer) -> Unit,
+    private val onDiagnostic: (String) -> Unit = {},
+    private val packetDiagnostics: Boolean = false,
 ) : AutoCloseable {
     private data class Command(val sessionId: Int, val payload: ByteArray)
 
@@ -30,13 +32,24 @@ class Iap2LinkChannel private constructor(
     private val controls = ArrayDeque<ByteArray>()
     private var controlBytes = 0
     private val fileTransfers = Iap2FileTransferReceiver()
+    // Bind the existing file protocol to the session declared in this phone profile.
+    // Profiles predating an override keep their original session-12 behavior.
+    private val fileTransferSessionId = linkConfig.synchronizationOverride?.sessions
+        ?.firstOrNull { it.kind == 1 && it.version == 2 }?.id
+        ?: Iap2LinkEngine.FILE_TRANSFER_SESSION_ID
 
     private var ready = false
+    private var outboundAcknowledged = false
     private var peerMaxControlPayloadBytes: Int? = null
     private var closing = false
     private var terminated = false
     private var terminalFailure: Throwable? = null
     private var streamCloseStarted = false
+    private var sentBytes = 0L
+    private var receivedBytes = 0L
+    private var handshakeStatus = Iap2HandshakeStatus()
+    private var metadataRecords = 0
+    private var statusRecords = 0
 
     private val worker = Thread(::runPump, "xcertplay-iap2-link").apply {
         isDaemon = true
@@ -58,6 +71,17 @@ class Iap2LinkChannel private constructor(
      */
     fun peerMaxControlPayloadBytes(): Int? = synchronized(lock) { peerMaxControlPayloadBytes }
 
+    fun handshakeStatus(): Iap2HandshakeStatus = synchronized(lock) { handshakeStatus }
+
+    fun awaitOutboundAcknowledged(timeoutMillis: Long): Boolean {
+        require(timeoutMillis >= 0)
+        synchronized(lock) {
+            waitFor(timeoutMillis) { closing || terminated || outboundAcknowledged }
+            throwTerminalFailureLocked()
+            return !closing && !terminated && outboundAcknowledged
+        }
+    }
+
     /**
      * Copies and queues one raw session-10 payload.  Returns false after close/termination or when
      * the bounded command queue is full.  A peer LSP length violation is discovered by the worker
@@ -70,7 +94,7 @@ class Iap2LinkChannel private constructor(
         val copy = bytes.copyOf()
         synchronized(lock) {
             if (terminated || closing) return false
-            return enqueueCommandLocked(Iap2LinkEngine.CONTROL_SESSION_ID, copy)
+            return enqueueCommandLocked(CONTROL_COMMAND, copy)
         }
     }
 
@@ -90,7 +114,7 @@ class Iap2LinkChannel private constructor(
             }
             throwTerminalFailureLocked()
             if (terminated || closing) return false
-            return enqueueCommandLocked(Iap2LinkEngine.CONTROL_SESSION_ID, copy)
+            return enqueueCommandLocked(CONTROL_COMMAND, copy)
         }
     }
 
@@ -143,9 +167,16 @@ class Iap2LinkChannel private constructor(
     }
 
     private fun runPump() {
-        val engine = Iap2LinkEngine(linkConfig)
+        val engine = Iap2LinkEngine(linkConfig, if (packetDiagnostics) { metadata ->
+            reportMetadata("PACKET ${metadata.diagnostic()}")
+        } else null)
         try {
             engine.start(wiredInitiator = initiateNegotiation, nowMillis = nowMillis())
+            linkConfig.synchronizationOverride?.let { local ->
+                reportMetadata("LOCAL_SYN sessions=${describeSessions(local.sessions)} window=${local.maxOutgoing} " +
+                    "maxLength=${local.maxLength} rto=${local.retransmissionTimeoutMillis} ack=${local.acknowledgementTimeoutMillis}")
+            }
+            publishHandshakeStatus(engine, "START", 0)
             while (!isClosing()) {
                 drainCommands(engine)
                 engine.advanceTime(nowMillis())
@@ -163,7 +194,11 @@ class Iap2LinkChannel private constructor(
                 when {
                     received == null -> Unit
                     received.isEmpty() -> engine.feedEof()
-                    else -> engine.feed(received, nowMillis())
+                    else -> {
+                        receivedBytes += received.size
+                        try { engine.feed(received, nowMillis()) }
+                        finally { publishHandshakeStatus(engine, "RX", received.size) }
+                    }
                 }
             }
             finish(null)
@@ -188,15 +223,52 @@ class Iap2LinkChannel private constructor(
                     }
                 }
             } ?: return
-            engine.sendSession(command.sessionId, command.payload, nowMillis())
+            if (command.sessionId == CONTROL_COMMAND) engine.sendControl(command.payload, nowMillis())
+            else engine.sendSession(command.sessionId, command.payload, nowMillis())
             if (isClosing()) return
         }
     }
 
     private fun flush(engine: Iap2LinkEngine) {
         val bytes = engine.takeOutput()
-        if (bytes.isNotEmpty()) underlying.send(bytes)
+        if (bytes.isNotEmpty()) {
+            underlying.send(bytes)
+            sentBytes += bytes.size
+            publishHandshakeStatus(engine, "TX", bytes.size)
+        }
     }
+
+    private fun publishHandshakeStatus(engine: Iap2LinkEngine, activity: String, bytes: Int) {
+        val status = Iap2HandshakeStatus(engine.state(), sentBytes, receivedBytes,
+            engine.validatedPeerSynchronization(), engine.negotiatedControlSessionId())
+        val previous = synchronized(lock) {
+            handshakeStatus.also {
+                handshakeStatus = status
+                outboundAcknowledged = commands.isEmpty() && engine.outboundAcknowledged()
+                lock.notifyAll()
+            }
+        }
+        if (status.state == Iap2LinkEngine.State.NORMAL && previous.state == status.state &&
+            (!packetDiagnostics || statusRecords >= 64)) return
+        statusRecords++
+        val peer = status.peerSynchronization
+        val detail = if (peer == null) "peerSyn=false" else
+            "peerSyn=true control=${status.controlSessionId} peerWindow=${peer.maxOutgoing} " +
+                "peerMaxLength=${peer.maxLength} peerRto=${peer.retransmissionTimeoutMillis} peerAck=${peer.acknowledgementTimeoutMillis} " +
+                "peerSessions=${describeSessions(peer.sessions)}"
+        try { onDiagnostic("$activity bytes=$bytes txComplete=${status.sentBytes} rx=${status.receivedBytes} state=${status.state} $detail") }
+        catch (_: Exception) { /* Diagnostics cannot affect the protocol pump. */ }
+    }
+
+    private fun reportMetadata(message: String) {
+        if (!packetDiagnostics || metadataRecords >= 120) return
+        metadataRecords++
+        try { onDiagnostic(message) } catch (_: Exception) { /* Metadata is observational only. */ }
+    }
+
+    private fun describeSessions(sessions: List<Iap2LinkEngine.SessionDescriptor>): String =
+        sessions.take(8).joinToString(",") { "${it.id}/${it.kind}/${it.version}" } +
+            if (sessions.size > 8) ",… total=${sessions.size}" else ""
 
     /** Returns false when a link terminal event has been observed. */
     private fun drainEvents(engine: Iap2LinkEngine): Boolean {
@@ -231,10 +303,11 @@ class Iap2LinkChannel private constructor(
                 }
 
                 is Iap2LinkEngine.Event.Session -> {
-                    if (event.sessionId != Iap2LinkEngine.FILE_TRANSFER_SESSION_ID) continue
+                    reportMetadata("ROUTING session=${event.sessionId} payloadBytes=${event.bytes.size} result=NON_CONTROL")
+                    if (event.sessionId != fileTransferSessionId) continue
                     val outcome = fileTransfers.accept(event.bytes)
                     outcome.replies.forEach { reply ->
-                        engine.sendSession(Iap2LinkEngine.FILE_TRANSFER_SESSION_ID, reply, nowMillis())
+                        engine.sendSession(fileTransferSessionId, reply, nowMillis())
                     }
                     outcome.completed?.let { completed ->
                         try {
@@ -246,7 +319,8 @@ class Iap2LinkChannel private constructor(
                 }
 
                 is Iap2LinkEngine.Event.Dead -> {
-                    finish(IOException(event.reason ?: "iAP2 link ended"))
+                    val reason = event.reason ?: "iAP2 link ended"
+                    finish(event.restartInput?.let { Iap2PeerDetectionRestart(reason, it) } ?: IOException(reason))
                     return false
                 }
             }
@@ -311,6 +385,7 @@ class Iap2LinkChannel private constructor(
     /** lock must already be held. */
     private fun enqueueCommandLocked(sessionId: Int, bytes: ByteArray): Boolean {
         if (!hasCommandCapacityLocked(bytes.size)) return false
+        outboundAcknowledged = false
         commands += Command(sessionId, bytes)
         commandBytes += bytes.size
         lock.notifyAll()
@@ -347,6 +422,7 @@ class Iap2LinkChannel private constructor(
     }
 
     companion object {
+        private const val CONTROL_COMMAND = -1
         private const val RECEIVE_CHUNK_BYTES = 8_192
         private const val RECEIVE_POLL_MILLIS = 100L
         private const val MINIMUM_RECEIVE_POLL_MILLIS = 1L
@@ -385,6 +461,22 @@ class Iap2LinkChannel private constructor(
             onArtwork: (Iap2ArtworkTransfer) -> Unit = {},
         ): Iap2LinkChannel =
             Iap2LinkChannel(underlying, WIRELESS_LINK_CONFIG, initiateNegotiation = false, onArtwork)
+                .also { it.worker.start() }
+
+        /** Phone/controller role: initiate synchronization and retain Bluetooth acknowledgements. */
+        fun openController(underlying: BlockingDuplexByteStream): Iap2LinkChannel =
+            Iap2LinkChannel(underlying, WIRELESS_LINK_CONFIG, initiateNegotiation = true, {})
+                .also { it.worker.start() }
+
+        fun openPhoneBluetooth(underlying: BlockingDuplexByteStream, profile: PhoneBluetoothProfile,
+            onDiagnostic: (String) -> Unit = {}): Iap2LinkChannel =
+            Iap2LinkChannel(underlying, profile.linkConfig(),
+                initiateNegotiation = profile == PhoneBluetoothProfile.LEGACY_CONTROLLER, {}, onDiagnostic, packetDiagnostics = true)
+                .also { it.worker.start() }
+
+        /** Wi-Fi phone role: the accessory initiates; TCP uses the existing zero-ack profile. */
+        fun openControllerTunnel(underlying: BlockingDuplexByteStream): Iap2LinkChannel =
+            Iap2LinkChannel(underlying, WIRED_LINK_CONFIG, initiateNegotiation = false, {})
                 .also { it.worker.start() }
 
         /**

@@ -1,0 +1,21 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries>
+        <package android:name="com.vivo.car.networking" />
+        <package android:name="com.vivo.carlauncher" />
+    </queries>
+    <application>
+        <activity-alias android:name="com.baidu.carlife.CarlifeActivity" android:targetActivity="com.carplay.app.MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="com.baidu.carlife.Action.CarlifePlatform" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.vivo.car.action.adb.view" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity-alias>
+        <service android:name="com.baidu.carlife.service.CarlifeConnectService" android:exported="true" android:foregroundServiceType="connectedDevice">
+            <intent-filter><action android:name="com.vivo.car.CAR_SERVICE" /></intent-filter>
+        </service>
+    </application>
+</manifest>
